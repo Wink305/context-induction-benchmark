@@ -1,0 +1,10 @@
+{
+  "dialogue_n": 40,
+  "unit_n": 420,
+  "clean_unit_n": 420,
+  "flagged_unit_n": 0,
+  "clean_rate": 1.0,
+  "severity_counts": {},
+  "code_counts": {},
+  "findings": []
+}

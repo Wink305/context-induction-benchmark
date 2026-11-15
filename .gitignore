@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+runs/
+
+# local working artifacts: regenerable from commands, never published
+.workbuddy/
+data/annotation/
+data/engineering_smoke/
+*.log

@@ -1,0 +1,326 @@
+{
+  "dialogue_n": 40,
+  "valid_n": 40,
+  "reports": [
+    {
+      "dialogue_id": "p0-001",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-002",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-003",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-004",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-005",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-006",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-007",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-008",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-009",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-010",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-011",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-012",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-013",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-014",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-015",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-016",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-017",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-018",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-019",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-020",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-021",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-022",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-023",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-024",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-025",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-026",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-027",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-028",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-029",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-030",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-031",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-032",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-033",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-034",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-035",
+      "valid": true,
+      "constraint_n": 12,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-036",
+      "valid": true,
+      "constraint_n": 0,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-037",
+      "valid": true,
+      "constraint_n": 0,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-038",
+      "valid": true,
+      "constraint_n": 0,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-039",
+      "valid": true,
+      "constraint_n": 0,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    },
+    {
+      "dialogue_id": "p0-040",
+      "valid": true,
+      "constraint_n": 0,
+      "schema_error_n": 0,
+      "semantic_error_n": 0,
+      "issues": []
+    }
+  ]
+}

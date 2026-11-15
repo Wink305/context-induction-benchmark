@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://context-benchmark.local/schemas/constraint-output.schema.json",
+  "title": "Constraint induction output",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["constraints"],
+  "properties": {
+    "constraints": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "type", "text", "evidence_turns", "valid_from", "valid_to", "scope", "superseded_by", "category"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^c[0-9]{3,}$"},
+          "type": {"enum": ["standing", "one_off", "implicit", "superseded"]},
+          "text": {"type": "string", "minLength": 1},
+          "evidence_turns": {
+            "type": "array",
+            "items": {"type": "integer", "minimum": 1},
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "valid_from": {"type": "integer", "minimum": 1},
+          "valid_to": {"type": ["integer", "null"], "minimum": 1},
+          "scope": {"enum": ["global", "session", "task"]},
+          "superseded_by": {"type": ["string", "null"], "pattern": "^c[0-9]{3,}$"},
+          "category": {"enum": ["communication", "process", "domain"]}
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"type": {"const": "implicit"}}},
+            "then": {"properties": {"evidence_turns": {"minItems": 3}}}
+          }
+        ]
+      }
+    }
+  }
+}

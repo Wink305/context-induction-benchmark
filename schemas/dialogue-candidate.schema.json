@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://context-benchmark.local/schemas/dialogue-candidate.schema.json",
+  "title": "Generated dialogue with unverified candidate truth",
+  "type": "object",
+  "required": ["dialogue_id", "status", "scenario", "turns", "candidate_truth", "distractors", "non_units", "axes"],
+  "properties": {
+    "dialogue_id": {"type": "string"},
+    "status": {"const": "generated_unannotated_not_gold"},
+    "scenario": {"enum": ["ecommerce", "finance", "travel", "telecom"]},
+    "turns": {
+      "type": "array",
+      "minItems": 25,
+      "maxItems": 40,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["turn", "speaker", "text"],
+        "properties": {
+          "turn": {"type": "integer", "minimum": 1},
+          "speaker": {"enum": ["user", "agent"]},
+          "text": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "candidate_truth": {"type": "array"},
+    "distractors": {"type": "array"},
+    "non_units": {"type": "array"},
+    "axes": {"type": "object"}
+  }
+}

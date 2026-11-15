@@ -1,0 +1,57 @@
+schema_version: 1
+status: requires_official_id_verification
+allow_api_calls: false
+notes: "Candidate roles only. Null IDs intentionally prevent accidental calls to drifting aliases."
+roles:
+  implementation:
+    provider: moonshot
+    label: K3.1 Pro
+    model_id: null
+    pinned_version: null
+    weight_sha256: null
+    quant: null
+    sku: standard
+    context_limit: 1048576
+    price_snapshot_date: null
+    call_date: null
+  consistency_review:
+    provider: moonshot
+    label: K3.1 Pro
+    model_id: null
+    pinned_version: null
+    weight_sha256: null
+    quant: null
+    sku: standard
+    context_limit: 1048576
+    price_snapshot_date: null
+    call_date: null
+  synthesis_draft:
+    provider: deepseek
+    label: V4.1 Flash 1017 candidate
+    model_id: null
+    pinned_version: "1017-candidate-needs-official-confirmation"
+    weight_sha256: null
+    quant: null
+    context_limit: 1000000
+    price_snapshot_date: null
+    call_date: null
+  executor_candidate:
+    provider: deepseek
+    label: V4.1 Flash 1017 candidate
+    model_id: null
+    pinned_version: "1017-candidate-needs-official-confirmation"
+    weight_sha256: null
+    quant: null
+    context_limit: 1000000
+    price_snapshot_date: null
+    call_date: null
+  judge:
+    provider: null
+    label: Third-party heterogeneous judges; not K3.1 Pro or V4.1 Flash
+    model_id: null
+    pinned_version: null
+  tested_models: []
+validation:
+  reject_null_model_id: true
+  reject_unpinned_version: true
+  require_weight_hash_for_local_weights: true

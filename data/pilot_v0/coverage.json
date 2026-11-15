@@ -1,0 +1,57 @@
+{
+  "dataset_version": "pilot-v0-candidate",
+  "status": "generated_unannotated_not_gold",
+  "dialogues": 40,
+  "dialogues_by_kind": {
+    "standard": 30,
+    "distractor": 5,
+    "empty": 5
+  },
+  "candidate_units": 420,
+  "types": {
+    "standing": 176,
+    "one_off": 113,
+    "implicit": 70,
+    "superseded": 61
+  },
+  "categories": {
+    "communication": 140,
+    "process": 211,
+    "domain": 69
+  },
+  "rule_dialogue_coverage": {
+    "R1": 35,
+    "R2": 35,
+    "R3": 26,
+    "R4": 35,
+    "R5": 40,
+    "R6": 35,
+    "R7": 27,
+    "R8": 35
+  },
+  "conflict_structures": {
+    "replace_withdraw": 18,
+    "replace_only": 9,
+    "withdraw_only": 8,
+    "none": 5
+  },
+  "turns": {
+    "min": 26,
+    "max": 40,
+    "mean": 37.8
+  },
+  "distractors": 10,
+  "probes": 70,
+  "checks": {
+    "dialogue_count_40": true,
+    "turn_bounds": true,
+    "candidate_units_400_600": true,
+    "all_four_types": true,
+    "rules_min_coverage": true,
+    "empty_min_coverage": true,
+    "distractor_min_coverage": true,
+    "all_status_unannotated": true
+  },
+  "accepted_for_annotation_start": true,
+  "not_a_gold_acceptance": true
+}

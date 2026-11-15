@@ -1,0 +1,16 @@
+{
+  "dataset_version": "pilot-v0-candidate",
+  "status": "generated_unannotated_not_gold",
+  "generation_method": "deterministic_template_v0",
+  "seed": 20261115,
+  "generator_config_sha256": "5690bf796dcc2acc0c43b7ad73de6150160dfdfe8129d16aa3514755f61153da",
+  "gold_version": null,
+  "human_annotation_complete": false,
+  "files": {
+    "tasks.jsonl": "29abacc8c36142a7b69a1e612971b81b0664f6698c7bc2511307d31ce5a4138f",
+    "candidate_truth.jsonl": "57503739aed53b32728b84c2fed77b0f83b51ee9be0473516f47e84094073e36",
+    "annotation_worksheet.jsonl": "35d07675c1c09446833fc8870859f1ff5d89bf207c63c5dffe1974237bec7632",
+    "calibration_ids.json": "5802b203d0ca54d84ca86ac2fdae7085a67cd1d97b2405d4d193841b33fe66a7",
+    "coverage.json": "2b4a95faaf2655457b981e9de190f6f35d6fbd9370a7d2f97a44c3d969f7e511"
+  }
+}

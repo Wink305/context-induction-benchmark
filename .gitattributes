@@ -1,0 +1,10 @@
+# Keep byte-level reproducibility: data files must hash identically on every OS.
+# Without -text, Windows checkouts convert LF to CRLF and every SHA-256 in
+# manifest.json stops matching.
+* text=auto eol=lf
+*.jsonl -text
+*.json -text
+*.py text eol=lf
+*.md text eol=lf
+*.yaml text eol=lf
+*.txt text eol=lf

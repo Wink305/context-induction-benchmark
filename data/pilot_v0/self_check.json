@@ -1,0 +1,149 @@
+{
+  "scientific_status": "validator_and_scorer_self_check_not_a_model_result",
+  "candidate_validation_pass_n": 40,
+  "candidate_dialogue_n": 40,
+  "candidate_issues": [],
+  "oracle_aggregate": {
+    "dialogue_n": 40,
+    "missing_prediction_dialogues": [],
+    "invalid_output_rate": {
+      "numerator": 0,
+      "denominator": 40,
+      "value": 0.0
+    },
+    "must_include": {
+      "numerator": 246,
+      "denominator": 246,
+      "value": 1.0
+    },
+    "must_exclude_absence": {
+      "numerator": 184,
+      "denominator": 184,
+      "value": 1.0
+    },
+    "overgeneralization": {
+      "numerator": 0,
+      "denominator": 174,
+      "value": 0.0
+    },
+    "fmr": {
+      "numerator": 10,
+      "denominator": 10,
+      "value": 1.0
+    },
+    "unmatched_prediction_rate": {
+      "numerator": 0,
+      "denominator": 420,
+      "value": 0.0
+    },
+    "empty_output_accuracy": {
+      "numerator": 5,
+      "denominator": 5,
+      "value": 1.0
+    },
+    "dimension_c": {
+      "superseded_type_accuracy": {
+        "numerator": 61,
+        "denominator": 61,
+        "value": 1.0
+      },
+      "expired_reuse_rate": {
+        "numerator": 0,
+        "denominator": 61,
+        "value": 0.0
+      },
+      "supersession_link_accuracy": {
+        "numerator": 27,
+        "denominator": 27,
+        "value": 1.0
+      }
+    },
+    "per_type": {
+      "standing": {
+        "tp": 176,
+        "fp": 0,
+        "fn": 0,
+        "precision": {
+          "numerator": 176,
+          "denominator": 176,
+          "value": 1.0
+        },
+        "recall": {
+          "numerator": 176,
+          "denominator": 176,
+          "value": 1.0
+        },
+        "f1": {
+          "value": 1.0,
+          "predicted_n": 176,
+          "gold_n": 176
+        }
+      },
+      "one_off": {
+        "tp": 113,
+        "fp": 0,
+        "fn": 0,
+        "precision": {
+          "numerator": 113,
+          "denominator": 113,
+          "value": 1.0
+        },
+        "recall": {
+          "numerator": 113,
+          "denominator": 113,
+          "value": 1.0
+        },
+        "f1": {
+          "value": 1.0,
+          "predicted_n": 113,
+          "gold_n": 113
+        }
+      },
+      "implicit": {
+        "tp": 70,
+        "fp": 0,
+        "fn": 0,
+        "precision": {
+          "numerator": 70,
+          "denominator": 70,
+          "value": 1.0
+        },
+        "recall": {
+          "numerator": 70,
+          "denominator": 70,
+          "value": 1.0
+        },
+        "f1": {
+          "value": 1.0,
+          "predicted_n": 70,
+          "gold_n": 70
+        }
+      },
+      "superseded": {
+        "tp": 61,
+        "fp": 0,
+        "fn": 0,
+        "precision": {
+          "numerator": 61,
+          "denominator": 61,
+          "value": 1.0
+        },
+        "recall": {
+          "numerator": 61,
+          "denominator": 61,
+          "value": 1.0
+        },
+        "f1": {
+          "value": 1.0,
+          "predicted_n": 61,
+          "gold_n": 61
+        }
+      }
+    },
+    "fama_macro": {
+      "numerator": 35.0,
+      "denominator": 35,
+      "value": 1.0
+    }
+  }
+}

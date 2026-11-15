@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "dataset_version": "pilot-v0-candidate",
+  "seed": 20261115,
+  "dialogue_count": 40,
+  "empty_count": 5,
+  "distractor_count": 5,
+  "calibration_count": 5,
+  "min_turns": 25,
+  "max_turns": 40,
+  "min_rule_dialogue_coverage": 4,
+  "min_empty_dialogues": 5,
+  "min_distractor_dialogues": 5,
+  "output_dir": "data/pilot_v0",
+  "generation_method": "deterministic_template_v0",
+  "status": "generated_unannotated_not_gold"
+}
