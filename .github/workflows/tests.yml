@@ -1,0 +1,50 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run tests (zero dependencies)
+        env:
+          PYTHONPATH: src
+        run: python -m unittest discover -s tests -v
+
+      - name: Regeneration must be byte-identical
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m context_benchmark generate --config configs/generator.json
+          git diff --exit-code -- data/pilot_v0
+          echo "deterministic: regeneration produced no changes"
+
+      - name: Audit must stay clean
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m context_benchmark audit --candidate data/pilot_v0/candidate_truth.jsonl --output audit.json
+          python - <<'PY'
+          import json, sys
+          report = json.load(open("audit.json", encoding="utf-8"))
+          print(f"clean {report['clean_unit_n']} / {report['unit_n']}")
+          if report["severity_counts"]:
+              sys.exit(f"audit findings present: {report['severity_counts']}")
+          PY
