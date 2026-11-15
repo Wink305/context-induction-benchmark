@@ -32,7 +32,10 @@ def read_json(path: str | Path) -> Any:
 def write_json(path: str | Path, value: Any) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # newline="\n" is mandatory: without it Windows writes CRLF and the bytes,
+    # hence every SHA-256 in the manifest, differ from a Linux run.
+    with target.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
 def read_jsonl(path: str | Path) -> list[Any]:
