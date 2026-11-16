@@ -11,9 +11,11 @@ from typing import Any
 from .adjudication import freeze_gold
 from .agreement import agreement_report
 from .audit import audit_dataset
+from .dimensions import registry as dimension_registry
 from .generator import generate_dataset
 from .harness import InductionRunner, write_call_logs
 from .io import read_json, read_jsonl, write_json, write_jsonl
+from .manifest import build_run_manifest, validate_submission
 from .providers import MockProvider, OpenAICompatibleProvider
 from .scoring import judge_calibration, score_counterfactual, score_dataset
 from .sheets import make_sheets, parse_sheets
@@ -60,6 +62,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     generate = sub.add_parser("generate", help="Generate unannotated P0 candidate dialogues")
     generate.add_argument("--config", default="configs/generator.json")
+    generate.add_argument("--output-dir", help="Append-only extension set directory; never the frozen data/pilot_v0")
+    generate.add_argument("--contributor", default="", help="Contributor handle for the extension dataset.json")
+    generate.add_argument("--split", default="public", choices=["public", "private", "holdout", "unspecified"])
 
     validate = sub.add_parser("validate", help="Validate candidate dialogues")
     validate.add_argument("--candidate", default="data/pilot_v0/candidate_truth.jsonl")
@@ -124,13 +129,39 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--output", required=True)
     run.add_argument("--logs", required=True)
     run.add_argument("--limit", type=int)
+    run.add_argument("--manifest", help="Also write a version-stamped, self-contained submission directory")
+    run.add_argument("--contributor", default="")
+    run.add_argument("--dimensions", nargs="*", default=[], help="Dimensions claimed by this run")
+    run.add_argument("--scores-declared", action="store_true")
+    run.add_argument("--repetition", type=int, default=1)
+
+    stamp = sub.add_parser("run-manifest", help="Build a version-stamped submission from existing run artifacts")
+    stamp.add_argument("--runtime", default="configs/runtime.json")
+    stamp.add_argument("--tasks", default="data/pilot_v0/tasks.jsonl")
+    stamp.add_argument("--prompt", default="prompts/induction_v1.txt")
+    stamp.add_argument("--predictions", required=True)
+    stamp.add_argument("--logs", required=True)
+    stamp.add_argument("--out-dir", required=True)
+    stamp.add_argument("--contributor", default="")
+    stamp.add_argument("--notes", default="")
+    stamp.add_argument("--dimensions", nargs="*", default=[])
+    stamp.add_argument("--scores-declared", action="store_true")
+    stamp.add_argument("--repetition", type=int, default=1)
+
+    check_sub = sub.add_parser("validate-submission", help="Validate a run submission or dataset extension directory")
+    check_sub.add_argument("--dir", required=True)
+    check_sub.add_argument("--benchmark-config", default="configs/benchmark.json")
+
+    sub.add_parser("dimensions", help="Print the six-axis dimension registry")
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     if args.command == "generate":
-        result = generate_dataset(args.config)
+        result = generate_dataset(
+            args.config, output_dir=args.output_dir, contributor=args.contributor, split=args.split,
+        )
     elif args.command == "validate":
         dialogues = read_jsonl(args.candidate)
         reports = [{"dialogue_id": dialogue["dialogue_id"], **validate_candidate_dialogue(dialogue).to_dict()} for dialogue in dialogues]
@@ -191,6 +222,29 @@ def main(argv: list[str] | None = None) -> None:
         write_jsonl(args.output, results)
         write_call_logs(args.logs, results)
         result = {"run_n": len(results), "valid_n": sum(row["valid"] for row in results), "failed_n": sum(not row["valid"] for row in results), "status": "engineering_run_not_a_benchmark_result"}
+        if args.manifest:
+            result["manifest"] = build_run_manifest(
+                runtime_path=args.runtime, tasks_path=args.tasks, prompt_path=args.prompt,
+                predictions_path=args.output, logs_path=args.logs, out_dir=args.manifest,
+                contributor=args.contributor, dimensions_reported=args.dimensions,
+                scores_declared=args.scores_declared, repetition_index=args.repetition,
+            )
+    elif args.command == "run-manifest":
+        result = build_run_manifest(
+            runtime_path=args.runtime, tasks_path=args.tasks, prompt_path=args.prompt,
+            predictions_path=args.predictions, logs_path=args.logs, out_dir=args.out_dir,
+            contributor=args.contributor, notes=args.notes,
+            dimensions_reported=args.dimensions, scores_declared=args.scores_declared,
+            repetition_index=args.repetition,
+        )
+    elif args.command == "validate-submission":
+        result = validate_submission(args.dir, benchmark_config_path=args.benchmark_config)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if not result["valid"]:
+            sys.exit(1)
+        return
+    elif args.command == "dimensions":
+        result = dimension_registry()
     else:
         raise AssertionError(args.command)
     print(json.dumps(result, ensure_ascii=False, indent=2))

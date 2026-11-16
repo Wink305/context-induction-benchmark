@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://context-benchmark.local/schemas/submission.schema.json@v1",
+  "title": "Context Induction Benchmark submission / run manifest",
+  "description": "One submission.json per submission directory. Every artifact listed in `files` must be present and hash-match. Version fields are mandatory so that a score can always be tied back to the exact benchmark, dataset, prompts and model that produced it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "submission_id", "submission_kind", "benchmark_version",
+    "dimension_set_version", "primary_dimension", "scores_declared",
+    "dimensions_reported", "status", "dataset", "run", "provenance",
+    "files", "evidence", "declared_limitations"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "submission_id": {"type": "string", "minLength": 1},
+    "submission_kind": {"enum": ["run_result", "dataset_extension", "annotation"]},
+    "benchmark_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+    "dimension_set_version": {"type": "string", "minLength": 1},
+    "primary_dimension": {"const": "A"},
+    "scores_declared": {"type": "boolean"},
+    "dimensions_reported": {"type": "array", "items": {"enum": ["A", "B", "C", "D", "E", "F"]}, "uniqueItems": true},
+    "status": {"type": "string", "minLength": 1},
+    "dataset": {
+      "type": "object",
+      "required": ["dataset_id", "dataset_version", "dataset_root", "split", "evidence_grade", "human_annotation_complete", "source_type"],
+      "properties": {
+        "dataset_id": {"type": "string", "minLength": 1},
+        "dataset_version": {"type": "string", "minLength": 1},
+        "dataset_root": {"type": "string", "minLength": 1},
+        "split": {"enum": ["public", "private", "holdout", "unspecified"]},
+        "evidence_grade": {"enum": ["generator_truth_rule_audited", "human_gold", "ai_precheck_only", "none"]},
+        "human_annotation_complete": {"type": "boolean"},
+        "gold_version": {"type": ["string", "null"]},
+        "source_type": {"enum": ["synthetic_template", "human_written", "real_redacted", "mixed"]},
+        "generation_method": {"type": ["string", "null"]},
+        "seed": {"type": ["integer", "null"]},
+        "generator_config_sha256": {"type": ["string", "null"]},
+        "dataset_manifest_sha256": {"type": ["string", "null"]},
+        "dialogue_n": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "run": {
+      "type": "object",
+      "required": ["run_id", "model", "usage", "failures", "denominator_disclosure"],
+      "properties": {
+        "run_id": {"type": "string", "minLength": 1},
+        "repetition_index": {"type": "integer", "minimum": 1},
+        "provider": {"type": "string"},
+        "model": {
+          "type": "object",
+          "required": ["model_id", "pinned_version"],
+          "properties": {
+            "model_id": {"type": "string", "minLength": 1},
+            "pinned_version": {"type": "string", "minLength": 1},
+            "weight_sha256": {"type": ["string", "null"]},
+            "quant": {"type": ["string", "null"]},
+            "sku": {"type": ["string", "null"]}
+          }
+        },
+        "prompt": {"type": "object"},
+        "scorer_version": {"type": "string"},
+        "temperature": {"type": ["number", "null"]},
+        "seed": {"type": ["integer", "null"]},
+        "usage": {
+          "type": "object",
+          "required": ["call_n", "prompt_tokens", "completion_tokens", "latency_ms", "cost"],
+          "properties": {
+            "call_n": {"type": "integer", "minimum": 0},
+            "prompt_tokens": {"type": ["integer", "null"]},
+            "completion_tokens": {"type": ["integer", "null"]},
+            "latency_ms": {"type": ["number", "null"]},
+            "cost": {"type": ["number", "null"]},
+            "missing_usage_fields_n": {"type": "integer", "minimum": 0}
+          }
+        },
+        "failures": {
+          "type": "object",
+          "required": ["provider_error_n", "invalid_output_n", "failure_counted_n"],
+          "properties": {
+            "provider_error_n": {"type": "integer", "minimum": 0},
+            "invalid_output_n": {"type": "integer", "minimum": 0},
+            "failure_counted_n": {"type": "integer", "minimum": 0}
+          }
+        },
+        "denominator_disclosure": {
+          "type": "object",
+          "required": ["dialogue_n", "scored_n", "failed_n"],
+          "properties": {
+            "dialogue_n": {"type": "integer", "minimum": 0},
+            "scored_n": {"type": "integer", "minimum": 0},
+            "failed_n": {"type": "integer", "minimum": 0}
+          }
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["contributor", "license", "compliance_note"],
+      "properties": {
+        "contributor": {"type": "string"},
+        "license": {"type": "string", "minLength": 1},
+        "compliance_note": {"type": ["string", "null"]},
+        "submitted_at": {"type": ["string", "null"]}
+      }
+    },
+    "files": {"type": "object", "additionalProperties": {"type": "string", "pattern": "^[a-f0-9]{64}$"}},
+    "evidence": {"type": "object", "additionalProperties": {"type": "string"}},
+    "declared_limitations": {"type": "array", "items": {"type": "string"}}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"scores_declared": {"const": true}}},
+      "then": {"properties": {"dimensions_reported": {"minItems": 1, "contains": {"const": "A"}}}}
+    },
+    {
+      "if": {"properties": {"dataset": {"properties": {"evidence_grade": {"const": "human_gold"}}}}},
+      "then": {"properties": {"dataset": {"properties": {"human_annotation_complete": {"const": true}}}}}
+    }
+  ]
+}

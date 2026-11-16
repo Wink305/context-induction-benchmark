@@ -48,3 +48,19 @@ jobs:
           if report["severity_counts"]:
               sys.exit(f"audit findings present: {report['severity_counts']}")
           PY
+
+      - name: Submission contract stays valid
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m context_benchmark dimensions > /dev/null
+          python -m context_benchmark run-induction \
+            --runtime configs/runtime.json \
+            --tasks data/pilot_v0/tasks.jsonl \
+            --prompt prompts/induction_v1.txt \
+            --output "$RUNNER_TEMP/cib_preds.jsonl" \
+            --logs "$RUNNER_TEMP/cib_calls.jsonl" \
+            --manifest "$RUNNER_TEMP/cib_submission" \
+            --contributor "ci" --dimensions A C D > /dev/null
+          python -m context_benchmark validate-submission --dir "$RUNNER_TEMP/cib_submission"

@@ -326,10 +326,36 @@ def coverage_report(dialogues: list[dict[str, Any]], config: dict[str, Any]) -> 
     }
 
 
-def generate_dataset(config_path: str | Path) -> dict[str, Any]:
+def generate_dataset(
+    config_path: str | Path,
+    *,
+    output_dir: str | Path | None = None,
+    contributor: str = "",
+    split: str = "public",
+) -> dict[str, Any]:
+    """Regenerate the frozen pilot set, or stamp an independent extension set.
+
+    ``output_dir`` is append-only: a contributed sample set lives in its own
+    directory and gets a ``dataset.json`` carrying the benchmark version and
+    file hashes. The frozen ``data/pilot_v0`` tree is never modified by this
+    path, so byte-identical regeneration checks keep working.
+    """
     config = read_json(config_path)
-    root = Path(config_path).resolve().parents[1]
-    output = root / config["output_dir"]
+    # Data paths are always relative to the package root, not to wherever the
+    # caller happened to put a contributed generator config.
+    root = Path(__file__).resolve().parents[2]
+    default_output = root / config["output_dir"]
+    extension = output_dir is not None
+    if extension:
+        output = Path(output_dir)
+        if not output.is_absolute():
+            output = root / output
+        if output.resolve() == default_output.resolve():
+            raise ValueError("output_dir must not point at the frozen pilot directory")
+        if config["dataset_version"] == "pilot-v0-candidate":
+            raise ValueError("An extension set must declare its own dataset_version")
+    else:
+        output = default_output
     output.mkdir(parents=True, exist_ok=True)
     rng = random.Random(config["seed"])
     scenarios = list(SCENARIOS) * (config["dialogue_count"] // len(SCENARIOS))
@@ -375,4 +401,12 @@ def generate_dataset(config_path: str | Path) -> dict[str, Any]:
         "files": {name: sha256_file(output / name) for name in files},
     }
     write_json(output / "manifest.json", manifest)
+    if extension:
+        from .manifest import build_dataset_manifest
+        build_dataset_manifest(
+            output,
+            benchmark_config_path=root / "configs/benchmark.json",
+            contributor=contributor,
+            split=split,
+        )
     return report
