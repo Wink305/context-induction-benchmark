@@ -72,6 +72,36 @@ class RunSubmissionTests(unittest.TestCase):
         self.assertTrue(document["evidence"]["src/context_benchmark/scoring.py"])
         self.assertEqual(document["files"]["predictions.jsonl"], sha256_file(self.package / "predictions.jsonl"))
 
+    def test_tampered_evidence_hash_is_detected(self):
+        """Changing scorer code hashes or the declared value must fail closed."""
+        document = read_json(self.package / "submission.json")
+        document["evidence"]["src/context_benchmark/scoring.py"] = "0" * 64
+        write_json(self.package / "submission.json", document)
+        self.assertIn("evidence_hash_mismatch", _codes(self.validate()))
+
+    def test_missing_required_field_is_detected(self):
+        document = read_json(self.package / "submission.json")
+        for key in ("provenance", "status", "declared_limitations", "evidence"):
+            document.pop(key, None)
+        write_json(self.package / "submission.json", document)
+        codes = _codes(self.validate())
+        self.assertIn("missing_required_field", codes)
+
+    def test_scorer_version_must_match_scoring_py(self):
+        document = read_json(self.package / "submission.json")
+        document["run"]["scorer_version"] = "scoring.py@000000000000"
+        write_json(self.package / "submission.json", document)
+        self.assertIn("scorer_version_mismatch", _codes(self.validate()))
+
+    def test_human_gold_claim_needs_version_and_hash(self):
+        document = read_json(self.package / "submission.json")
+        document["dataset"]["evidence_grade"] = "human_gold"
+        document["dataset"]["human_annotation_complete"] = True
+        write_json(self.package / "submission.json", document)
+        codes = _codes(self.validate())
+        self.assertIn("human_gold_without_version", codes)
+        self.assertIn("human_gold_without_hash", codes)
+
     def test_tampered_artifact_is_detected(self):
         with (self.package / "calls.jsonl").open("a", encoding="utf-8") as handle:
             handle.write("{}\n")
@@ -176,6 +206,20 @@ class VersionConsistencyTests(unittest.TestCase):
     def test_package_version_matches_benchmark_config(self):
         from context_benchmark import __version__
         self.assertEqual(read_json(BENCHMARK_CONFIG)["benchmark_version"], __version__)
+
+    def test_pyproject_version_matches_package(self):
+        import re
+        from context_benchmark import __version__
+        text = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+        match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(1), __version__)
+
+    def test_frozen_tasks_hash_is_stamped_in_config(self):
+        config = read_json(BENCHMARK_CONFIG)
+        stamped = config["dataset_policy"]["frozen_tasks_sha256"]
+        actual = sha256_file(REPO_ROOT / "data/pilot_v0/tasks.jsonl")
+        self.assertEqual(stamped, actual)
 
     def test_configured_dimension_set_matches_registry(self):
         from context_benchmark.dimensions import DIMENSION_SET_VERSION, attribution_ids, rankable_ids

@@ -36,24 +36,42 @@ class HarnessTests(unittest.TestCase):
         self.assertTrue(result["failure_counted"])
         self.assertEqual(len(result["attempts"]), 3)
 
-    def test_design_has_four_ablations_and_isolated_three_arms(self):
+    def test_design_has_full_factorial_backgrounds_and_arms(self):
         conditions = planned_conditions()
-        self.assertEqual(len(conditions), 6)
+        self.assertEqual(len(conditions), 12)
         self.assertEqual({mode for mode, _ in conditions}, {"full_context", "distilled", "raw_turns", "no_history"})
-        self.assertIn(("no_history", "fake"), conditions)
+        for mode in ("full_context", "distilled", "raw_turns", "no_history"):
+            self.assertTrue(all((mode, arm) in conditions for arm in ("true", "none", "fake")))
 
-    def test_fake_constraints_are_length_aligned(self):
+    def test_fake_constraints_are_length_aligned_and_unlabeled(self):
         constraints = [public_constraint(item) for item in self.dialogue["candidate_truth"][:2]]
         fake = make_fake_constraints(constraints)
         for source, control in zip(constraints, fake):
             self.assertEqual(len(source["text"]), len(control["text"]))
             self.assertNotEqual(source["text"], control["text"])
-            self.assertTrue(control["fake_control"])
+            # No metadata field may reveal which arm a constraint came from.
+            self.assertEqual(set(control), set(source))
+            self.assertNotIn("fake_control", control)
+            self.assertEqual(control["id"], source["id"])
+
+    def test_injected_prompt_does_not_leak_arm_metadata(self):
+        from context_benchmark.harness import public_injected
+        item = dict(public_constraint(self.dialogue["candidate_truth"][0]))
+        item["fake_control"] = True
+        item["internal_score"] = 99
+        self.assertEqual(set(public_injected(item)), set(public_constraint(item)))
+        self.assertNotIn("fake_control", public_injected(item))
 
     def test_true_none_fake_executor_flow(self):
+        true_texts = {item["text"] for item in self.dialogue["candidate_truth"]}
         def choose(request):
             content = request.messages[1]["content"]
-            if '"constraints":[]' in content or "fake_control" in content:
+            # A correct executor follows whatever rule is injected; the none
+            # arm has an empty intervention block. It must NOT rely on any
+            # explicit "fake" marker, because none exists any more.
+            injected_empty = '"constraints":[]' in content.split("干预要点：")[-1]
+            follows_injected = any(text in content for text in true_texts)
+            if injected_empty or not follows_injected:
                 return '{"choice":"b2"}'
             return '{"choice":"b1"}'
         provider = MockProvider(callback=choose)
@@ -65,7 +83,27 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(scored["true_delta_mean"]["value"], 1.0)
         self.assertEqual(scored["fake_delta_mean"]["value"], 0.0)
 
-    def test_r2_guard_fails_without_truncating(self):
+    def test_missing_induced_target_is_not_scored(self):
+        provider = MockProvider(['{"choice":"b1"}'])
+        runner = ExecutorRunner(provider, self.config(), "executor prompt")
+        row = runner.run_probe(
+            self.dialogue, self.dialogue["probes"][0], [], "no_history", "true", "tight"
+        )
+        self.assertFalse(row["scorable"])
+        self.assertEqual(row["error"], "target_missing_from_induction")
+        self.assertEqual(provider.requests, [])
+
+    def test_budget_truncation_is_recorded(self):
+        from context_benchmark.harness import serialize_history
+        dialogue = self.dialogue
+        constraints = [public_constraint(item) for item in dialogue["candidate_truth"]]
+        text, meta = serialize_history(dialogue, "distilled", constraints, budget_chars=200)
+        self.assertTrue(meta["truncated"])
+        self.assertGreater(len(meta["dropped_ids"]), 0)
+        self.assertGreater(len(meta["selected_ids"]), 0)
+        self.assertEqual(set(meta["selected_ids"]) & set(meta["dropped_ids"]), set())
+
+    def test_no_compression_guard_fails_without_truncating(self):
         guard = NoCompressionGuard(100, len)
         before = guard.before_call("x" * 91, 10)
         self.assertFalse(before["allowed"])
@@ -75,6 +113,44 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(after["failure_reason"], "actual_context_overflow")
         missing = guard.after_call(None, None)
         self.assertEqual(missing["failure_reason"], "missing_actual_token_usage")
+
+    def test_run_no_compression_is_end_to_end(self):
+        from context_benchmark.harness import run_no_compression
+        config = self.config()
+        config["r2_context_limit_tokens"] = 10 ** 9
+        provider = MockProvider([json.dumps({"constraints": []})])
+        record = run_no_compression(provider, config, self.dialogue, "prompt")
+        self.assertTrue(record["scorable"])
+        self.assertTrue(record["task_success"])
+        self.assertFalse(record["compression"])
+        self.assertFalse(record["truncation"])
+
+    def test_run_no_compression_overflow_fails_closed(self):
+        from context_benchmark.harness import run_no_compression
+        config = self.config()
+        config["r2_context_limit_tokens"] = 10  # tiny window
+        provider = MockProvider([json.dumps({"constraints": []})])
+        record = run_no_compression(provider, config, self.dialogue, "prompt")
+        self.assertFalse(record["task_success"])
+        self.assertEqual(record["failure_reason"], "estimated_context_overflow")
+        self.assertEqual(provider.requests, [])  # never called the model
+
+    def test_survival_trace_is_end_to_end(self):
+        from context_benchmark.harness import run_survival_trace
+        from context_benchmark.io import read_jsonl
+        truth = read_jsonl("data/pilot_v0/candidate_truth.jsonl")[0]
+
+        def choose(request):
+            return '{"choice":"follow"}'
+
+        provider = MockProvider(callback=choose)
+        record = run_survival_trace(provider, self.config(), self.dialogue, truth, "prompt")
+        self.assertEqual(len(record["compliance"]), len(truth["candidate_truth"]))
+        self.assertTrue(all(record["compliance"]))
+        # E can feed the survival analyser directly.
+        from context_benchmark.survival import survival_report
+        report = survival_report([record], bootstrap_n=20)
+        self.assertIn("median_survival_turn", report)
 
 
 if __name__ == "__main__":

@@ -123,7 +123,13 @@ def get_dimension(identifier: str) -> dict[str, Any] | None:
 
 
 def validate_dimension_set(ids: list[str], *, scores_declared: bool = False) -> list[str]:
-    """Return issue strings. Keeps contributor submissions honest about axes."""
+    """Return issue strings. Keeps contributor submissions honest about axes.
+
+    Structural validity (known ids, no duplicates, primary present, at least
+    one rankable axis) is enforced unconditionally. ``scores_declared`` only
+    adds the requirement that a *non-empty* report exists — it is never a
+    switch that lets an invalid axis set through when false.
+    """
     issues: list[str] = []
     known = dimension_ids()
     if len(set(ids)) != len(ids):
@@ -131,6 +137,10 @@ def validate_dimension_set(ids: list[str], *, scores_declared: bool = False) -> 
     for identifier in ids:
         if identifier not in known:
             issues.append(f"unknown_dimension:{identifier}")
+    # E/F are attribution-only and may be reported on their own, as long as no
+    # score is declared. The moment a score is declared, the ranked report must
+    # include the primary axis; that is the rule that stops attribution axes
+    # being smuggled into the leaderboard.
     if scores_declared:
         if not ids:
             issues.append("scores_declared_but_no_dimension")

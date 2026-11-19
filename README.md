@@ -39,16 +39,33 @@ git clone https://github.com/Wink305/context-induction-benchmark.git
 cd context-induction-benchmark
 export PYTHONPATH=src          # Windows: set PYTHONPATH=src
 
-python -m unittest discover -s tests -v          # 80 tests
+python -m unittest discover -s tests -v          # 110+ tests
 python -m context_benchmark dimensions           # print the six-axis registry
 python -m context_benchmark generate --config configs/generator.json
 python -m context_benchmark audit    --candidate data/pilot_v0/candidate_truth.jsonl --output data/pilot_v0/audit.json
 python -m context_benchmark self-check --candidate data/pilot_v0/candidate_truth.jsonl
 ```
 
-`generate` is deterministic: the same seed reproduces byte-identical output (`candidate_truth.jsonl` SHA-256 `57503739…`).
+`generate` is deterministic: the same seed reproduces byte-identical output (`candidate_truth.jsonl` SHA-256 `111bbc62…`, regenerated after the lexical-variant and probe-semantics fixes).
 
-`self-check` feeds the candidate truth back in as if it were a model prediction. It should report 1.0 on every metric. **That is a scorer sanity check, not a model result.**
+`self-check` now has a built-in negative control: it must give the oracle a
+high score and gibberish-text predictions a low one (gap ≥ 0.5), or it exits
+non-zero. **That is still a scorer sanity check, not a model result.**
+
+The scorer also applies a **text gate** (`TEXT_MATCH_MIN = 0.10`, `ANCHOR_COVERAGE_MIN = 0.08`): a prediction must share bigrams with both the gold text and the user turns it cites before it can be matched. Without this gate, correct ids/types/evidence plus garbage text scored 1.0 on the primary metric. These thresholds are **uncalibrated heuristics** — no human-labelled calibration set exists yet; P1 must fit them on one before model scores are reported.
+
+### Attribution axes E/F (runnable pilots)
+
+```bash
+PYTHONPATH=src python -m context_benchmark run-survival-trace \
+  --output runs/e_trace.jsonl                 # per-turn compliance probes
+PYTHONPATH=src python -m context_benchmark survival \
+  --input runs/e_trace.jsonl --output runs/e_report.json
+PYTHONPATH=src python -m context_benchmark run-r2 \
+  --output runs/f_trace.jsonl                 # no-compression, fail-closed window guard
+```
+
+E emits per-constraint compliance sequences consumed by `survival` (Kaplan–Meier, REC/ROB). F runs the full dialogue uncompressed through `NoCompressionGuard`: pre-call estimate and post-call actual usage both must fit the window, otherwise the task is marked failed — never truncated. Both remain attribution-only.
 
 ## Repository layout
 
@@ -65,12 +82,12 @@ src/context_benchmark/
   scoring.py       dual-list, FAMA, FMR, empty-output, counterfactual arms
   agreement.py     Cohen's κ, clustered bootstrap CI, Gwet's AC1
   adjudication.py  third-reviewer decisions; frozen gold cannot be overwritten
-  harness.py       two-stage harness, four background ablations, three arms
+  harness.py       two-stage harness, four background ablations, three arms; CLI: run-induction, run-probes
   providers.py     mock and OpenAI-compatible providers (real calls fail closed)
   survival.py      Kaplan–Meier, REC/ROB
   audit.py         rule audit of the candidate truth
   sheets.py        annotation sheet render / parse
-tests/             80 unit and adversarial tests
+tests/             89 unit and adversarial tests
 data/pilot_v0/     frozen P0 candidate data (see below)
 ```
 
@@ -89,6 +106,8 @@ data/pilot_v0/     frozen P0 candidate data (see below)
 
 The five calibration dialogues each plant a different trap: a standard segment, a same-structure segment in another domain, a double-withdrawal segment, a pseudo-constraint segment, and an empty segment where the correct answer is to output nothing.
 
+`data/annotation/calibration_A/` holds blank, neutral sheets. Structural hints are opt-in (`make-sheets --truth data/pilot_v0/candidate_truth.jsonl`); the answer-free worksheet alone never produces an "answer is empty" hint. Earlier sheets that told annotators all five segments were empty have been regenerated.
+
 ## Using your own model
 
 Real API calls are disabled by default (`allow_api_calls: false`) and will fail closed until a verified model id and pinned version are supplied. This is deliberate: aliases drift, and an unpinned model makes a benchmark unreproducible.
@@ -105,6 +124,24 @@ python -m context_benchmark run-induction \
 ```
 
 Every request, response, token count, latency and cost is written to the call log. Failed calls, schema violations and semantic errors are **counted as failures**, never silently dropped.
+
+### Executor probes (dimension B)
+
+`run-probes` is the command-line entry point for the three-arm / four-background conditions. It consumes the induction predictions, so a probe whose target constraint was not induced is marked unscorable instead of silently becoming a "failure" data point.
+
+```bash
+PYTHONPATH=src python -m context_benchmark run-probes \
+  --runtime configs/runtime.mine.json \
+  --tasks data/pilot_v0/tasks.jsonl \
+  --truth data/pilot_v0/candidate_truth.jsonl \
+  --predictions runs/preds.jsonl \
+  --executor-prompt prompts/executor_v1.txt \
+  --output runs/probes.jsonl \
+  --logs runs/probe_calls.jsonl \
+  --scores runs/counterfactual.json
+```
+
+`false_trigger_rate` counts only probes explicitly marked `related: false`, and fires when the model follows the injected constraint in that unrelated situation (`true > none`). With no such probes it returns a null value with a zero denominator, not a misleading 0. The pilot probes do not yet carry `related`, so B has **no usable false-trigger estimate** until a dataset adds them. A contributed generator config can set `"add_unrelated_probes": true` (with its own `dataset_version` and seed) to append a `p003` control probe to every non-empty dialogue; the frozen pilot is unaffected.
 
 ## Versioning and submissions
 
@@ -174,11 +211,13 @@ The repository is documentation-first; the design record is in Chinese.
 ## Known limitations
 
 1. Synthetic dialogues are template-generated; lexical diversity is low and the implicit-constraint cues may be more regular than real user behaviour.
-2. The text matcher is **uncalibrated**. It is usable for engineering checks, not for reporting model scores.
+2. The text matcher and its new text/anchor gates are **uncalibrated heuristics**. They block the known garbage-text exploit, but are usable for engineering checks only — not for reporting model scores.
 3. `raw_turns` is a `first_recent_v0` baseline, not a reproduction of the selection policy in arXiv:2609.34227.
 4. Only 40 dialogues. Anything inferred from them is a pilot signal.
 5. No external reproduction, no pre-registration, no peer review.
 6. The six-axis set is a **structural re-registration**, not six independently validated constructs. D was split from A and E/F renamed from R1/R2; their orthogonality has not been measured because the P1 correlation matrix has not been run. A pairwise r > 0.8 would merge them back.
+7. Dimension B now has a CLI, but no real model results exist. The pilot probes lack the `related` flag, so `false_trigger_rate` has a null denominator.
+8. Dimensions E/F now have runnable CLIs (`run-survival-trace` + `survival`, and `run-r2`), so they can produce traces and reports end-to-end. They are still **attribution-only** and never enter the ranking. The token counter for F is a `chars/4` heuristic until a model-specific tokenizer is wired in, and E's per-turn probes are a simple engineering construction, not a validated survival instrument. Treat both as P1 pilots, not reported results.
 
 ## License
 

@@ -60,6 +60,25 @@ class ScoringTests(unittest.TestCase):
         result = score_dialogue(dialogue, {"dialogue_id": dialogue["dialogue_id"], "output": None})
         self.assertFalse(result["empty_output"]["correct"])
 
+    def test_gibberish_text_cannot_score_on_primary_metric(self):
+        """Negative control: correct ids/types/evidence with unrelated text must score 0."""
+        row = self.prediction()
+        for constraint in row["output"]["constraints"]:
+            constraint["text"] = "甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未"
+        result = score_dialogue(self.dialogue, row)
+        self.assertTrue(result["valid_output"])
+        self.assertEqual(result["content_gate"]["content_ok_n"], 0)
+        self.assertEqual(result["must_include"]["numerator"], 0)
+        self.assertEqual(result["classification"]["tp"], 0)
+        self.assertEqual(result["match_n"], 0)
+
+    def test_short_human_paraphrase_still_passes_text_gate(self):
+        row = self.prediction()
+        target = next(item for item in row["output"]["constraints"] if item["id"] == "c007")
+        target["text"] = "本单暂不代提交"  # 0.118 bigram overlap with the gold text
+        result = score_dialogue(self.dialogue, row)
+        self.assertEqual(result["must_include"]["value"], 1.0)
+
     def test_semantically_invalid_output_scores_zero_not_partial_credit(self):
         row = self.prediction()
         row["output"]["constraints"][0]["evidence_turns"] = [999]
@@ -74,6 +93,19 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(result["fmr"]["denominator"], 0)
         self.assertIsNone(result["fmr"]["value"])
 
+    def test_unscorable_rows_do_not_count_as_failures(self):
+        """Unscorable probes must be excluded, not scored as compliant=0."""
+        rows = [
+            {"probe_id": "p1", "arm": "true", "compliant": 1, "scorable": True, "related": True},
+            {"probe_id": "p1", "arm": "none", "compliant": 0, "scorable": True, "related": True},
+            {"probe_id": "p1", "arm": "fake", "compliant": 0, "scorable": False, "related": True},
+        ]
+        result = score_counterfactual(rows)
+        self.assertEqual(result["denominators"]["unscorable_probes_excluded"], 1)
+        # The fake arm has no scorable rows, so the whole probe is skipped.
+        self.assertEqual(result["probe_n"], 0)
+        self.assertIsNone(result["true_delta_mean"]["value"])
+
     def test_fake_positive_delta_triggers_validity_warning(self):
         rows = []
         for arm, compliant in (("true", 1), ("none", 0), ("fake", 1)):
@@ -82,6 +114,36 @@ class ScoringTests(unittest.TestCase):
         self.assertTrue(result["validity_warning_fake_positive"])
         self.assertEqual(result["true_delta_mean"]["value"], 1.0)
         self.assertEqual(result["fake_delta_mean"]["value"], 1.0)
+
+
+    def test_false_trigger_requires_explicit_unrelated_probe(self):
+        rows = [
+            {"probe_id": "p1", "arm": arm, "compliant": compliant, "related": True}
+            for arm, compliant in (("true", 1), ("none", 0), ("fake", 0))
+        ]
+        result = score_counterfactual(rows)
+        self.assertIsNone(result["false_trigger_rate"]["value"])
+        self.assertEqual(result["denominators"]["false_trigger"], 0)
+
+    def test_false_trigger_counts_following_an_unrelated_constraint(self):
+        for compliant, expected in ((1, 1.0), (0, 0.0)):
+            with self.subTest(compliant=compliant):
+                rows = [
+                    {"probe_id": "p1", "arm": arm, "compliant": c, "related": False}
+                    for arm, c in (("true", compliant), ("none", 0), ("fake", 0))
+                ]
+                result = score_counterfactual(rows)
+                self.assertEqual(result["false_trigger_rate"]["value"], expected)
+                self.assertEqual(result["denominators"]["false_trigger"], 1)
+
+    def test_missing_related_flag_is_excluded_not_counted_as_related(self):
+        rows = [
+            {"probe_id": "p1", "arm": arm, "compliant": c}
+            for arm, c in (("true", 1), ("none", 0), ("fake", 0))
+        ]
+        result = score_counterfactual(rows)
+        self.assertEqual(result["denominators"]["unclassified_related"], 1)
+        self.assertIsNone(result["false_trigger_rate"]["value"])
 
 
 if __name__ == "__main__":

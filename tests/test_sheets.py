@@ -13,7 +13,7 @@ from context_benchmark.sheets import (
     parse_sheets,
     render_sheet,
 )
-from context_benchmark.io import write_jsonl
+from context_benchmark.io import read_jsonl, write_jsonl
 
 
 def wrap(body: str) -> str:
@@ -37,8 +37,71 @@ class SheetRenderTest(unittest.TestCase):
         self.assertIn("以后都只用邮件", text)
         self.assertIn("客服", text)
         self.assertIn("校准集", text)
-        # empty dialogue gets the leave-it-blank hint
+        # neutral guidance must remain, but never reveal the answer
         self.assertIn("留空", text)
+        self.assertNotIn("正确答案是留空", text)
+
+    def test_example_does_not_leak_pilot_gold(self):
+        """The format example must be fictional, never a real gold unit."""
+        dialogue = read_jsonl("data/pilot_v0/candidate_truth.jsonl")[0]
+        text = render_sheet(dialogue, index=1, total=5, calibration=True, annotator="A")
+        gold_fields = [
+            ("evidence_turns", "3"), ("evidence_turns", "13"),
+            ("text", "仅用邮件联系"), ("text", "回复只要两行重点"),
+            ("text", "电话提醒工单"),
+        ]
+        # The fictional framing appears before the example block; gold values
+        # must not appear either in the framing or in the example rows.
+        leaked_region = text.split("示例：", 1)[0].split("## 三、答案区", 1)[-1] + text.split("示例：", 1)[-1].split("在下面两行注释", 1)[0]
+        for _, value in gold_fields:
+            self.assertNotIn(value, leaked_region, f"gold value {value!r} leaked into the sheet example")
+        self.assertIn("虚构对话", leaked_region)
+
+    def test_worksheet_without_truth_never_produces_structural_hints(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worksheet = root / "worksheet.jsonl"
+            record = {
+                "dialogue_id": "p0-777",
+                "status": "awaiting_independent_annotation",
+                "turns": [{"turn": 1, "speaker": "user", "text": "以后都只用邮件"}],
+                "annotations": [],
+            }
+            write_jsonl(worksheet, [record])
+            out = root / "sheets"
+            manifest = make_sheets(worksheet, out, calibration_ids=["p0-777"])
+            text = (out / "p0-777.md").read_text(encoding="utf-8")
+            self.assertFalse(manifest["hints_from_truth"])
+            self.assertNotIn("正确答案是留空", text)
+            self.assertNotIn("显式撤回", text)
+
+    def test_truth_opt_in_adds_hints_without_revealing_empty_answer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worksheet = root / "worksheet.jsonl"
+            truth = root / "truth.jsonl"
+            record = {
+                "dialogue_id": "p0-778",
+                "status": "awaiting_independent_annotation",
+                "turns": [{"turn": 1, "speaker": "user", "text": "那条不算"}],
+                "annotations": [],
+            }
+            write_jsonl(worksheet, [record])
+            write_jsonl(truth, [{
+                **record,
+                "candidate_truth": [{
+                    "id": "c001", "type": "superseded", "text": "旧规则", "evidence_turns": [1],
+                    "valid_from": 1, "valid_to": 1, "scope": "global", "superseded_by": None,
+                    "category": "process", "rule_tags": ["R3"],
+                }],
+                "distractors": [],
+            }])
+            out = root / "sheets"
+            manifest = make_sheets(worksheet, out, calibration_ids=["p0-778"], truth_path=truth)
+            text = (out / "p0-778.md").read_text(encoding="utf-8")
+            self.assertTrue(manifest["hints_from_truth"])
+            self.assertIn("显式撤回", text)
+            self.assertNotIn("正确答案是留空", text)
 
     def test_pipe_in_text_does_not_break_table(self):
         dialogue = {

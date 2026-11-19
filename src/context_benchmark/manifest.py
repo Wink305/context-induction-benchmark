@@ -24,10 +24,36 @@ from .dimensions import DIMENSION_SET_VERSION, PRIMARY_DIMENSION, validate_dimen
 from .io import canonical_json, read_json, read_jsonl, sha256_file, sha256_text, write_json
 
 DEFAULT_BENCHMARK_CONFIG = "configs/benchmark.json"
+
+
+def _resolve_config_path(path: str | Path) -> Path:
+    """Resolve a config path; bare relative paths mean the repo's canonical file.
+
+    This makes the CLI work from any cwd (console-script installs) while a
+    contributor cannot point the validator at a hand-edited config to relax the
+    version rules: validation always uses the canonical in-repo copy.
+    """
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate
+    in_cwd = Path.cwd() / candidate
+    if in_cwd.is_file():
+        return in_cwd
+    return REPO_ROOT / candidate
 SUBMISSION_FILE = "submission.json"
 DATASET_FILE = "dataset.json"
 FROZEN_DATASET_VERSION = "pilot-v0-candidate"
 REPO_ROOT = Path(__file__).resolve().parents[2]
+# Evidence entries that are canonical repository files: these MUST hash-match
+# the installed tree, otherwise someone can change the scorer/config and ship a
+# submission that still claims reproducibility. Other entries (runtime config,
+# prompt, tasks.jsonl) are run-specific artefacts copied into the package and
+# are verified against the package directory instead.
+REPO_EVIDENCE_FILES = frozenset({
+    "configs/benchmark.json",
+    "configs/generator.json",
+    "src/context_benchmark/scoring.py",
+})
 
 _BASE_LIMITATIONS = [
     "No human gold and no inter-annotator agreement have been measured for this project yet.",
@@ -37,7 +63,7 @@ _BASE_LIMITATIONS = [
 
 
 def benchmark_config(path: str | Path = DEFAULT_BENCHMARK_CONFIG) -> dict[str, Any]:
-    config = read_json(path)
+    config = read_json(_resolve_config_path(path))
     if config.get("benchmark_version") is None:
         raise ValueError(f"{path}: benchmark_version missing")
     if config["benchmark_version"] != PACKAGE_VERSION:
@@ -57,8 +83,17 @@ def _sha_or_none(path: Path) -> str | None:
     return sha256_file(path) if path.is_file() else None
 
 
-def _frozen_tasks_sha() -> str | None:
-    """Hash of the frozen public task file, used to reject copy-paste extensions."""
+def _frozen_tasks_sha(config: dict[str, Any] | None = None) -> str | None:
+    """Hash of the frozen public task file, used to reject copy-paste extensions.
+
+    The hash is stamped into configs/benchmark.json so this check keeps working
+    from a pip-installed package in any cwd. The on-disk manifest is only a
+    fallback for the in-repo development path.
+    """
+    if config:
+        stamped = (config.get("dataset_policy") or {}).get("frozen_tasks_sha256")
+        if stamped:
+            return stamped
     path = REPO_ROOT / "data/pilot_v0/manifest.json"
     if not path.is_file():
         return None
@@ -250,7 +285,7 @@ def build_dataset_manifest(
              "calibration_ids.json", "coverage.json", "manifest.json"]
     present = [name for name in names if (root / name).is_file()]
     files = {name: sha256_file(root / name) for name in present}
-    frozen_sha = _frozen_tasks_sha()
+    frozen_sha = _frozen_tasks_sha(config)
     if frozen_sha and files.get("tasks.jsonl") == frozen_sha:
         raise ValueError(
             "Extension set reproduces the frozen pilot tasks.jsonl byte-for-byte. "
@@ -280,6 +315,57 @@ def build_dataset_manifest(
     }
     write_json(root / DATASET_FILE, dataset)
     return {"dataset_id": dataset["dataset_id"], "path": str(root / DATASET_FILE), "file_n": len(present)}
+
+
+def _check_schema_shape(document: dict[str, Any], kind: str, issues: list[dict[str, str]]) -> None:
+    """Enforce the JSON Schema contract's required keys and value types.
+
+    The project keeps zero third-party dependencies, so jsonschema is not
+    imported. This mirror covers the contract's required fields and the types
+    that previous hand-written checks missed (status, provenance, evidence,
+    usage/failures structure). It must stay in sync with submission.schema.json.
+    """
+    required = [
+        "schema_version", "submission_id", "submission_kind", "benchmark_version",
+        "dimension_set_version", "primary_dimension", "scores_declared",
+        "dimensions_reported", "status", "dataset", "run", "provenance",
+        "files", "evidence", "declared_limitations",
+    ]
+    for key in required:
+        if key not in document:
+            _issue(issues, "missing_required_field", f"submission.json is missing required field {key!r}")
+    if document.get("schema_version") != 1:
+        _issue(issues, "schema_version_mismatch", "schema_version must be 1")
+    if document.get("submission_kind") != kind:
+        _issue(issues, "submission_kind_mismatch", f"submission_kind must be {kind!r}")
+    if not isinstance(document.get("status"), str) or not document["status"]:
+        _issue(issues, "invalid_status", "status must be a non-empty string")
+    if not isinstance(document.get("declared_limitations"), list):
+        _issue(issues, "invalid_declared_limitations", "declared_limitations must be a list")
+    if not isinstance(document.get("scores_declared"), bool):
+        _issue(issues, "invalid_scores_declared", "scores_declared must be a boolean")
+    prov = document.get("provenance")
+    if not isinstance(prov, dict):
+        _issue(issues, "invalid_provenance", "provenance must be an object")
+    else:
+        for key in ("contributor", "license", "compliance_note"):
+            if key not in prov:
+                _issue(issues, "missing_provenance_field", f"provenance is missing {key!r}")
+    run = document.get("run")
+    if isinstance(run, dict):
+        for key in ("usage", "failures", "denominator_disclosure"):
+            if not isinstance(run.get(key), dict):
+                _issue(issues, "invalid_run_detail_type", f"run.{key} must be an object")
+        usage = run.get("usage")
+        if isinstance(usage, dict):
+            for key in ("call_n", "prompt_tokens", "completion_tokens", "latency_ms", "cost"):
+                if key not in usage:
+                    _issue(issues, "missing_usage_field", f"run.usage is missing {key!r}")
+        failures = run.get("failures")
+        if isinstance(failures, dict):
+            for key in ("provider_error_n", "invalid_output_n", "failure_counted_n"):
+                if not isinstance(failures.get(key), int):
+                    _issue(issues, "invalid_failure_count", f"run.failures.{key} must be an integer")
 
 
 def _issue(issues: list[dict[str, str]], code: str, message: str) -> None:
@@ -319,7 +405,9 @@ def validate_submission(directory: str | Path, *, benchmark_config_path: str | P
     Returns a report; never raises on a bad package (CI needs a readable result).
     """
     root = Path(directory)
-    config = benchmark_config(benchmark_config_path)
+    # Validation rules always come from the in-repo canonical config. A caller
+    # cannot point this at a hand-edited config to relax version/dimension rules.
+    config = benchmark_config(REPO_ROOT / DEFAULT_BENCHMARK_CONFIG)
     issues: list[dict[str, str]] = []
     if not root.is_dir():
         _issue(issues, "not_a_directory", f"{root} does not exist")
@@ -336,11 +424,13 @@ def validate_submission(directory: str | Path, *, benchmark_config_path: str | P
         return {"valid": False, "kind": None, "issues": issues, "checked_files": 0}
 
     _check_version_fields(document, config, issues)
+    if kind == "run_result":
+        _check_schema_shape(document, kind, issues)
     if kind == "dataset_extension":
         if document.get("dataset_version") == FROZEN_DATASET_VERSION and root.name != "pilot_v0":
             _issue(issues, "frozen_dataset_version_reused",
                    "an extension set cannot reuse the frozen pilot-v0-candidate version")
-        frozen_sha = _frozen_tasks_sha()
+        frozen_sha = _frozen_tasks_sha(config)
         if frozen_sha and document.get("files", {}).get("tasks.jsonl") == frozen_sha:
             _issue(issues, "duplicate_of_frozen_pilot",
                    "tasks.jsonl is byte-identical to the frozen pilot set; this is not a new sample")
@@ -349,10 +439,21 @@ def validate_submission(directory: str | Path, *, benchmark_config_path: str | P
     if isinstance(dataset, dict):
         if dataset.get("evidence_grade") == "human_gold" and dataset.get("human_annotation_complete") is not True:
             _issue(issues, "fake_human_gold", "human_gold declared without human_annotation_complete=true")
+        if dataset.get("evidence_grade") == "human_gold":
+            # A boolean alone is self-declared. Require a gold version and its
+            # hash to be stamped, so a generator-truth set cannot be relabelled
+            # as human gold by flipping one flag.
+            if not dataset.get("gold_version"):
+                _issue(issues, "human_gold_without_version", "human_gold requires an explicit gold_version")
+            evidence = document.get("evidence", {}) if isinstance(document.get("evidence", {}), dict) else {}
+            dataset_hash = dataset.get("dataset_manifest_sha256")
+            if not dataset_hash and not evidence.get("gold_v1.jsonl"):
+                _issue(issues, "human_gold_without_hash", "human_gold requires a dataset_manifest_sha256 or gold_v1.jsonl evidence hash")
         if dataset.get("source_type") == "real_redacted":
             provenance = document.get("provenance", {})
-            if not provenance.get("compliance_note"):
-                _issue(issues, "missing_compliance_note", "real_redacted data requires a compliance_note")
+            note = provenance.get("compliance_note") if isinstance(provenance, dict) else None
+            if not note or (isinstance(note, str) and len(note.strip()) < 15):
+                _issue(issues, "missing_compliance_note", "real_redacted data requires a substantive compliance_note (>=15 chars)")
 
     if kind == "run_result":
         run = document.get("run", {})
@@ -371,6 +472,36 @@ def validate_submission(directory: str | Path, *, benchmark_config_path: str | P
             _issue(issues, "primary_dimension_mismatch", f"primary dimension must be {PRIMARY_DIMENSION}")
 
     checked = _check_hashes(root, document.get("files"), issues)
+    # The evidence map records the hashes of the code/config/prompts that
+    # produced the score. Without re-checking it, anyone can edit scoring.py
+    # (or the benchmark config) and ship a "reproducible" submission with stale
+    # or invented evidence hashes. Verify against the installed repo tree.
+    evidence = document.get("evidence")
+    if kind == "run_result":
+        if not isinstance(evidence, dict) or not evidence:
+            _issue(issues, "no_evidence", "a run submission needs a non-empty {path: sha256} evidence map")
+        else:
+            for name, expected in evidence.items():
+                if name not in REPO_EVIDENCE_FILES:
+                    # Run-specific provenance (runtime, prompt, tasks, dataset
+                    # manifest) is informational here; those bytes are verified
+                    # through files{} and the dataset manifest hash elsewhere.
+                    continue
+                path = REPO_ROOT / name
+                if not path.is_file():
+                    _issue(issues, "missing_evidence_file", f"evidence file {name} is absent from the benchmark tree")
+                    continue
+                actual = sha256_file(path)
+                if actual != expected:
+                    _issue(issues, "evidence_hash_mismatch", f"{name}: declared {str(expected)[:12]}…, actual {actual[:12]}…")
+    # The scorer version must match the actual scoring.py content, otherwise a
+    # submission can claim a scorer it was never scored by.
+    scorer_version = (document.get("run") or {}).get("scorer_version")
+    scoring_path = REPO_ROOT / "src/context_benchmark/scoring.py"
+    if kind == "run_result" and scoring_path.is_file():
+        expected_scorer = f"scoring.py@{sha256_file(scoring_path)[:12]}"
+        if scorer_version != expected_scorer:
+            _issue(issues, "scorer_version_mismatch", f"declared {scorer_version!r}, expected {expected_scorer!r}")
     return {
         "valid": not issues,
         "kind": kind,

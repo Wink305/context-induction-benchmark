@@ -210,7 +210,7 @@ def _focus_hints(dialogue: dict[str, Any]) -> list[str]:
     hints: list[str] = []
     if not truth:
         hints.append(
-            "**本段大概率一条约束都没有。正确答案是留空**——不要为了填而填。"
+            "若通读后确认没有用户约束，答案区留空；不要为了填而填，也不要为了凑数硬标。"
         )
     if dialogue.get("distractors"):
         hints.append(
@@ -264,18 +264,23 @@ def render_sheet(
 
 格式：`依据轮次 | 类型 | 作用域 | 类别 | 内容摘要 | 失效说明`
 
-- 依据轮次：`3` 或 `7,9,11`（隐含约束需要多处依据）
+- 依据轮次：写出该约束出现的用户轮次，多处用逗号分隔（如 `2,4,6`）
 - 类型：`S` 稳定 / `O` 一次性 / `I` 隐含 / `T` 已失效
 - 作用域：`global` / `session` / `task`
 - 类别：`C` 沟通 / `P` 流程 / `D` 业务
 - 内容摘要：一句话，不超过 20 字
-- 失效说明：**只有 T 类填**，写 `15`（15 轮撤回）或 `被 29 轮替代`；其他留空
+- 失效说明：**只有 T 类填**，写撤回轮次（如 `8`）或 `被 10 轮替代`；其他留空
 
+> 下面的例子是一段**虚构对话**的格式演示，轮次和内容都与你手上的题目无关，
+> 照抄不会得到任何分数。请只把它当作「一行该长什么样」的参考。
+>
+> 虚构对话：第 2 轮用户说「以后文件都用蓝色封面」；第 8 轮说「蓝色封面那条取消」；
+> 第 4、6、10 轮用户三次说「附件别超过两页」。
 示例：
 ```
-3 | S | global | C | 仅用邮件联系 | 
-13 | T | global | C | 电话提醒工单 | 15
-7,9,11 | I | global | C | 回复只要两行重点 |
+2 | S | global | D | 文件用蓝色封面 |
+8 | T | global | D | 文件用蓝色封面 | 10
+4,6,10 | I | global | P | 附件不超过两页 |
 ```
 
 在下面两行注释之间逐行填写，不要删除注释标记：
@@ -300,8 +305,13 @@ def make_sheets(
     ids: Iterable[str] | None = None,
     annotator: str = "A",
     calibration_ids: Iterable[str] | None = None,
+    truth_path: str | Path | None = None,
 ) -> dict[str, Any]:
     dialogues = read_jsonl(worksheet_path)
+    truth_by_id: dict[str, dict[str, Any]] = {}
+    if truth_path is not None:
+        for row in read_jsonl(truth_path):
+            truth_by_id[row["dialogue_id"]] = row
     wanted = set(ids) if ids else None
     cal = set(calibration_ids or [])
     target_dir = Path(out_dir)
@@ -316,9 +326,17 @@ def make_sheets(
         if is_cal:
             cal_index += 1
         path = target_dir / f"{dialogue['dialogue_id']}.md"
+        # The worksheet is intentionally answer-free. Structural hints need a
+        # separate truth file and are opt-in; they must never be derived from
+        # the mere absence of labels in the worksheet.
+        sheet_input = dict(dialogue)
+        if truth_path is not None:
+            source = truth_by_id.get(dialogue["dialogue_id"], {})
+            sheet_input["candidate_truth"] = source.get("candidate_truth", [])
+            sheet_input["distractors"] = source.get("distractors", [])
         path.write_text(
             render_sheet(
-                dialogue,
+                sheet_input,
                 index=cal_index if is_cal else 0,
                 total=cal_total if is_cal else 0,
                 calibration=is_cal,
@@ -331,6 +349,7 @@ def make_sheets(
         "annotator": annotator,
         "sheets": len(created),
         "calibration": sorted(cal & {d["dialogue_id"] for d in dialogues}),
+        "hints_from_truth": truth_path is not None,
         "out_dir": str(target_dir),
     }
     write_json(target_dir / "_manifest.json", manifest)

@@ -14,11 +14,12 @@
   },
   "prompt_versions": {
     "induction": "induction-v1",
-    "executor": "executor-v1"
+    "executor": "executor-v2"
   },
   "dataset_policy": {
     "frozen_public_dir": "data/pilot_v0",
     "frozen_dataset_version": "pilot-v0-candidate",
+    "frozen_tasks_sha256": "ea2c87889b15cdc1169e12415bf77e35ecbcb6c7c4a5296b6097f2fd199df2c4",
     "extension_dir": "data/contrib",
     "extension_mode": "append_only_new_directory",
     "private_split_supported": true,

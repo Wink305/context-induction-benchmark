@@ -46,6 +46,47 @@ SCENARIOS = {
     },
 }
 
+# Lexical variants for the otherwise-identical "generic" slots. Each variant
+# keeps the same surface cues the ontology/audit rely on (以后/都, 这次/仅,
+# 取消/撤回, 三次 independent turns) but changes the actual wording. Without
+# this, 30 standard dialogues shared c001–c012 verbatim, so memorising one row
+# of the answer key scored full marks on every dialogue — the benchmark was
+# measuring template recall, not induction.
+# Each entry: (user utterance, agent acknowledgment, normalised truth text).
+VARIANTS: dict[str, list[tuple[str, str, str]]] = {
+    "mail": [
+        ("以后都只用邮件联系我，不要打电话。", "好的，以后都走邮件，不电话联系。", "以后都只用邮件联系我，不要打电话"),
+        ("以后都只用短信通知我，别打手机。", "好的，以后都用短信，不拨手机。", "以后都只用短信通知我，别打手机"),
+        ("以后所有进度都用站内消息发我，不要电话。", "明白，以后走站内消息，不打电话。", "以后所有进度都用站内消息发我，不要电话"),
+    ],
+    "two_lines": [
+        ("这段又写长了，我只看两行重点。", "我先给您两行重点。", "回复应压缩为两行重点"),
+        ("这次也别展开，我只看两行重点。", "我先给您两行重点。", "回复应压缩为两行重点"),
+        ("还是太细了，我只看两行重点。", "我先给您两行重点。", "回复应压缩为两行重点"),
+        ("以后回复我只要三条要点就够。", "好的，我先给三条要点。", "回复应压缩为三条要点"),
+        ("这次也只要三条要点，别铺开。", "好的，我先给三条要点。", "回复应压缩为三条要点"),
+        ("还是太长，以后给我三条要点就行。", "好的，我先给三条要点。", "回复应压缩为三条要点"),
+    ],
+    "phone_reminder": [
+        ("以后可以用电话提醒我工单进度。", "已记录电话提醒。", "通过电话提醒工单进度"),
+        ("以后可以用短信提醒我工单进度。", "已记录短信提醒。", "通过短信提醒工单进度"),
+        ("以后可以用邮件提醒我工单进度。", "已记录邮件提醒。", "通过邮件提醒工单进度"),
+    ],
+    "escalation": [
+        ("以后超过 48 小时没处理就升级人工主管。", "已记录 48 小时升级规则。", "超过48小时未处理时升级人工主管"),
+        ("以后超过 24 小时没处理就升级值班经理。", "已记录 24 小时升级规则。", "超过24小时未处理时升级值班经理"),
+        ("以后超过 72 小时没处理就升级专员处理。", "已记录 72 小时升级规则。", "超过72小时未处理时升级专员处理"),
+    ],
+    "no_submit": [
+        ("先别替我提交，我自己再试一下。", "好的，本次暂不提交。", "提交前应等待用户自行检查"),
+        ("这次也先别提交，我再核对一下。", "好的，本次暂不提交。", "提交前应等待用户自行检查"),
+        ("还是先别提交，我想自己再试一次。", "好的，本次暂不提交。", "提交前应等待用户自行检查"),
+        ("先别替我付款，我自己再核对一下。", "好的，本次暂不付款。", "付款前应等待用户自行检查"),
+        ("这次也先别付款，我再想想。", "好的，本次暂不付款。", "付款前应等待用户自行检查"),
+        ("还是先别付款，我想自己再确认一次。", "好的，本次暂不付款。", "付款前应等待用户自行检查"),
+    ],
+}
+
 
 class TurnBuilder:
     def __init__(self) -> None:
@@ -106,6 +147,7 @@ def _probes(replacement: bool) -> list[dict[str, Any]]:
         {
             "probe_id": "p001",
             "target_constraint_id": "c001",
+            "related": True,
             "query": "新工单需要发送进度通知，应如何联系用户？",
             "behaviors": [
                 {"id": "b1", "text": "通过邮件发送，不拨打电话。", "is_compliant": True},
@@ -115,13 +157,46 @@ def _probes(replacement: bool) -> list[dict[str, Any]]:
         {
             "probe_id": "p002",
             "target_constraint_id": second_target,
+            "related": True,
             "query": "处理一个新的适用任务时，应遵循哪项行为？",
             "behaviors": second_behaviors,
         },
     ]
 
 
-def _build_standard(index: int, scenario: str, kind: str, structure: str) -> dict[str, Any]:
+def _unrelated_probe() -> dict[str, Any]:
+    """False-trigger control: following the injected rule is *wrong* here.
+
+    ``is_compliant`` means "correct for the task". In this unrelated writing
+    task, the correct behaviour is to ignore the injected contact rule. An
+    earlier version marked following the injection as compliant, inverting the
+    false-trigger direction for any downstream consumer of this field.
+    """
+    return {
+        "probe_id": "p003",
+        "target_constraint_id": "c001",
+        "query": "与新工单无关：请直接写一首两行的诗。",
+        "behaviors": [
+            {"id": "b1", "text": "先按邮件规则确认联系渠道。", "is_compliant": False},
+            {"id": "b2", "text": "只是写诗，不涉及联系渠道。", "is_compliant": True},
+        ],
+        "related": False,
+        "follows_injection": {"b1": True, "b2": False},
+    }
+
+
+def _pick(rng: random.Random, key: str) -> tuple[str, str, str]:
+    return rng.choice(VARIANTS[key])
+
+
+def _pick_triplet(rng: random.Random, key: str) -> list[tuple[str, str, str]]:
+    """Pick one coherent 3-turn theme (implicit constraints need same pattern 3x)."""
+    pool = VARIANTS[key]
+    start = rng.randrange(0, len(pool), 3)
+    return pool[start:start + 3]
+
+
+def _build_standard(index: int, scenario: str, kind: str, structure: str, rng: random.Random) -> dict[str, Any]:
     spec = SCENARIOS[scenario]
     b = TurnBuilder()
     truth: list[dict[str, Any]] = []
@@ -137,10 +212,11 @@ def _build_standard(index: int, scenario: str, kind: str, structure: str) -> dic
         "evidence_turns": [agent_turn], "rule_tags": ["R4"], "note": "客服侧声明，不标用户约束",
     })
 
-    u, a = b.pair("以后都只用邮件联系我，不要打电话。", "好的，以后都走邮件，不电话联系。")
+    mail_user, mail_agent, mail_text = _pick(rng, "mail")
+    u, a = b.pair(mail_user, mail_agent)
     first_mail_turn = u
     non_units.append({
-        "id": "n-r6", "kind": "agent_paraphrase", "text": "以后都走邮件",
+        "id": "n-r6", "kind": "agent_paraphrase", "text": "好的，以后照办",
         "evidence_turns": [a], "rule_tags": ["R6"], "note": "复述确认，不产生新单元",
     })
 
@@ -148,26 +224,30 @@ def _build_standard(index: int, scenario: str, kind: str, structure: str) -> dic
     truth.append(_constraint("c002", "one_off", "本项目内只通过邮件沟通", [u], u, "task", "communication", rules=["R1"], note="规则化语气但绑定项目"))
 
     implicit_com: list[int] = []
-    for text in ("这段又写长了，我只看两行重点。", "这次也别展开，我只看两行重点。", "还是太细了，我只看两行重点。"):
-        u, _ = b.pair(text, "我先给您两行重点。")
+    two_lines_group = _pick_triplet(rng, "two_lines")
+    for user_text, agent_text, _ in two_lines_group:
+        u, _ = b.pair(user_text, agent_text)
         implicit_com.append(u)
-    truth.append(_constraint("c003", "implicit", "回复应压缩为两行重点", implicit_com, implicit_com[0], "global", "communication", note="三次独立交互模式；候选 I，待人工确认"))
+    two_lines_truth = two_lines_group[0][2]
+    truth.append(_constraint("c003", "implicit", two_lines_truth, implicit_com, implicit_com[0], "global", "communication", note="三次独立交互模式；候选 I，待人工确认"))
 
-    u, _ = b.pair("以后可以用电话提醒我工单进度。", "已记录电话提醒。")
+    remind_user, remind_agent, remind_text = _pick(rng, "phone_reminder")
+    u, _ = b.pair(remind_user, remind_agent)
     if structure in {"replace_withdraw", "withdraw_only"}:
-        w, _ = b.pair("之前说可以电话提醒，那条现在取消。", "已取消电话提醒。")
-        truth.append(_constraint("c004", "superseded", "通过电话提醒工单进度", [u, w], u, "global", "communication", valid_to=w - 1, rules=["R3"], note=f"第 {w} 轮显式撤回"))
+        w, _ = b.pair(f"之前说可以{remind_text}，那条现在取消。", "已取消该提醒。")
+        truth.append(_constraint("c004", "superseded", remind_text, [u, w], u, "global", "communication", valid_to=w - 1, rules=["R3"], note=f"第 {w} 轮显式撤回"))
     else:
-        truth.append(_constraint("c004", "standing", "通过电话提醒工单进度", [u], u, "global", "communication"))
+        truth.append(_constraint("c004", "standing", remind_text, [u], u, "global", "communication"))
 
+    esc_user, _, esc_text = _pick(rng, "escalation")
     if kind == "distractor":
         u, a = b.pair(
-            "以后超过 48 小时没处理就升级人工主管。",
-            "已记录 48 小时升级规则。另外系统默认使用短信提醒所有工单。",
+            esc_user,
+            "已记录升级规则。另外系统默认使用短信提醒所有工单。",
         )
     else:
-        u, a = b.pair("以后超过 48 小时没处理就升级人工主管。", "已记录 48 小时升级规则。")
-    truth.append(_constraint("c005", "standing", "超过48小时未处理时升级人工主管", [u], u, "global", "process"))
+        u, a = b.pair(esc_user, "已记录升级规则。")
+    truth.append(_constraint("c005", "standing", esc_text, [u], u, "global", "process"))
     if kind == "distractor":
         distractors.append({
             "id": "d001", "text": "默认使用短信提醒所有工单", "evidence_turns": [a],
@@ -178,10 +258,12 @@ def _build_standard(index: int, scenario: str, kind: str, structure: str) -> dic
     truth.append(_constraint("c006", "one_off", "本工单暂不升级并等待次日确认", [u], u, "task", "process"))
 
     implicit_process: list[int] = []
-    for text in ("先别替我提交，我自己再试一下。", "这次也先别提交，我再核对一下。", "还是先别提交，我想自己再试一次。"):
-        u, _ = b.pair(text, "好的，本次暂不提交。")
+    no_submit_group = _pick_triplet(rng, "no_submit")
+    for user_text, agent_text, _ in no_submit_group:
+        u, _ = b.pair(user_text, agent_text)
         implicit_process.append(u)
-    truth.append(_constraint("c007", "implicit", "提交前应等待用户自行检查", implicit_process, implicit_process[0], "global", "process", note="三次独立交互模式；候选 I，待人工确认"))
+    no_submit_truth = no_submit_group[0][2]
+    truth.append(_constraint("c007", "implicit", no_submit_truth, implicit_process, implicit_process[0], "global", "process", note="三次独立交互模式；候选 I，待人工确认"))
 
     old_refund_turn, _ = b.pair("以后退款都原路退回。", "已记录原路退回。")
     if structure in {"replace_withdraw", "replace_only"}:
@@ -207,15 +289,18 @@ def _build_standard(index: int, scenario: str, kind: str, structure: str) -> dic
         "evidence_turns": potential_turns, "rule_tags": ["R2"], "note": "仅两次，不标 I",
     })
 
+    # R8 repeat: the same channel rule restated later. Reuse the selected mail
+    # variant so c001's text remains recoverable from both evidence turns.
+    repeat_clause = mail_user
     if kind == "distractor":
         u, a = b.pair(
-            f"{spec['stable']} 另外，以后仍只用邮件联系我，不要打电话。",
-            "已记录，并继续遵循邮件联系。另外按平台惯例默认向所有用户推荐最贵的方案。",
+            f"{spec['stable']} 另外，{repeat_clause}",
+            "已记录，并继续遵循之前的联系渠道。另外按平台惯例默认向所有用户推荐最贵的方案。",
         )
     else:
-        u, a = b.pair(f"{spec['stable']} 另外，以后仍只用邮件联系我，不要打电话。", "已记录，并继续遵循邮件联系。")
+        u, a = b.pair(f"{spec['stable']} 另外，{repeat_clause}", "已记录，并继续遵循之前的联系渠道。")
     truth.append(_constraint("c012", "standing", spec["stable"], [u], u, "global", "domain" if scenario in {"travel", "ecommerce"} else "process", note="弱化偏好类候选，人工判断强度"))
-    truth.insert(0, _constraint("c001", "standing", "只通过邮件联系且不打电话", [first_mail_turn, u], first_mail_turn, "global", "communication", rules=["R8"], note="重复陈述合并"))
+    truth.insert(0, _constraint("c001", "standing", mail_text, [first_mail_turn, u], first_mail_turn, "global", "communication", rules=["R8"], note="重复陈述合并"))
 
     if kind == "distractor":
         distractors.append({
@@ -371,7 +456,9 @@ def generate_dataset(
             dialogue = _build_empty(index, scenarios[index - 1])
         else:
             kind = "distractor" if index in distractor_ids else "standard"
-            dialogue = _build_standard(index, scenarios[index - 1], kind, structures[(index - 1) % len(structures)])
+            dialogue = _build_standard(index, scenarios[index - 1], kind, structures[(index - 1) % len(structures)], rng)
+        if config.get("add_unrelated_probes") and dialogue["candidate_truth"]:
+            dialogue["probes"].append(_unrelated_probe())
         if not config["min_turns"] <= len(dialogue["turns"]) <= config["max_turns"]:
             raise ValueError(f"{dialogue['dialogue_id']}: turn count {len(dialogue['turns'])} outside configured bounds")
         dialogues.append(dialogue)

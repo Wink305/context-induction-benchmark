@@ -49,6 +49,31 @@ jobs:
               sys.exit(f"audit findings present: {report['severity_counts']}")
           PY
 
+      - name: Self-check discrimination gate
+        env:
+          PYTHONPATH: src
+        run: python -m context_benchmark self-check --candidate data/pilot_v0/candidate_truth.jsonl
+
+      - name: Attribution axes E/F run end-to-end
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m context_benchmark run-r2 --limit 3 --output "$RUNNER_TEMP/f_trace.jsonl" > /dev/null
+          python -m context_benchmark run-survival-trace --limit 3 \
+            --truth data/pilot_v0/candidate_truth.jsonl \
+            --output "$RUNNER_TEMP/e_trace.jsonl" > /dev/null
+          python -m context_benchmark survival \
+            --input "$RUNNER_TEMP/e_trace.jsonl" --output "$RUNNER_TEMP/e_report.json" > /dev/null
+          python - <<'PY'
+          import json, sys
+          e = json.load(open("$RUNNER_TEMP/e_report.json", encoding="utf-8"))
+          f = [json.loads(l) for l in open("$RUNNER_TEMP/f_trace.jsonl", encoding="utf-8")]
+          assert e.get("session_n", 0) > 0, e
+          assert len(f) == 3 and all(row.get("compression") is False for row in f), f
+          print(f"E session records: {e['session_n']}; F no-compression traces: {len(f)}")
+          PY
+
       - name: Submission contract stays valid
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
         env:
@@ -64,3 +89,23 @@ jobs:
             --manifest "$RUNNER_TEMP/cib_submission" \
             --contributor "ci" --dimensions A C D > /dev/null
           python -m context_benchmark validate-submission --dir "$RUNNER_TEMP/cib_submission"
+
+      - name: Tampered submission must be rejected
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        env:
+          PYTHONPATH: src
+        run: |
+          cp -r "$RUNNER_TEMP/cib_submission" "$RUNNER_TEMP/cib_tampered"
+          python - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("$RUNNER_TEMP/cib_tampered/submission.json")
+          d = json.loads(p.read_text(encoding="utf-8"))
+          # Flip a core evidence hash: changing the scorer must invalidate the run.
+          d["evidence"]["src/context_benchmark/scoring.py"] = "0" * 64
+          p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+          PY
+          if python -m context_benchmark validate-submission --dir "$RUNNER_TEMP/cib_tampered"; then
+            echo "ERROR: tampered submission was accepted" >&2
+            exit 1
+          fi
+          echo "tamper gate: tampered submission correctly rejected"

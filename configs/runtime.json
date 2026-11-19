@@ -2,6 +2,7 @@
   "schema_version": 1,
   "provider": "mock",
   "model_id": "mock-inducer-v0",
+  "executor_model_id": "mock-executor-v0",
   "pinned_version": "mock-1",
   "quant": "not_applicable",
   "allow_api_calls": false,
@@ -12,7 +13,7 @@
   "seed": 20261115,
   "max_retries": 2,
   "prompt_version": "induction-v1",
-  "executor_prompt_version": "executor-v1",
+  "executor_prompt_version": "executor-v2",
   "background_modes": ["full_context", "distilled", "raw_turns", "no_history"],
   "intervention_arms": ["true", "none", "fake"],
   "budgets_chars": {

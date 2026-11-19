@@ -17,6 +17,23 @@ class JudgeCalibrationTests(unittest.TestCase):
         self.assertEqual(result["unextractable_rate"]["value"], 0.25)
         self.assertEqual(result["overall_error_rate"]["denominator"], 4)
 
+    def test_unextractable_is_in_kappa_gate_not_excluded(self):
+        """Abstentions must lower the gate kappa, not vanish from its denominator."""
+        rows = [
+            {"gold": "yes", "predicted": "yes"},
+            {"gold": "no", "predicted": "no"},
+            {"gold": "yes", "predicted": "unextractable"},
+            {"gold": "no", "predicted": "unextractable"},
+        ]
+        result = judge_calibration(rows)
+        self.assertIn("human_machine_kappa_includes_unextractable", result)
+        self.assertEqual(
+            result["human_machine_kappa_includes_unextractable"]["n"], 4,
+        )
+        # scorable-only sees just 2 rows; the gate sees all 4.
+        self.assertEqual(result["human_machine_kappa_scorable_only"]["n"], 2)
+        self.assertFalse(result["pass_kappa_0_60"])
+
 
 if __name__ == "__main__":
     unittest.main()
