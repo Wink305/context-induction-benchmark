@@ -89,7 +89,7 @@
         "id": "annotation_chain",
         "promise": "Annotation chain: answer-free sheets, boundary tags, kappa-only gate, adjudication, provenance-checked gold freeze",
         "state": "implemented",
-        "caveat": "The chain is exercised end to end by tests/test_annotation_pipeline.py. The freeze refuses generator or AI provenance, requires two distinct annotators, and refuses a reviewer who is one of them.",
+        "caveat": "The chain is exercised end to end by tests/test_annotation_pipeline.py. The freeze refuses generator or AI provenance, requires two distinct annotation sets and annotators, recomputes and cross-checks the agreement report, compares label content (not just markers) with every shipped generator truth file before and after adjudication, and refuses a reviewer who is one of the annotators. Parsed sheets declare provenance unknown unless a source is stated. Distractors are optional and, when attached, are disclosed as dataset truth rather than human annotation.",
         "evidence": [
           "src/context_benchmark/sheets.py",
           "src/context_benchmark/agreement.py",

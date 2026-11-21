@@ -32,11 +32,14 @@ WORKSHEET = "data/pilot_v0/annotation_worksheet.jsonl"
 TRUTH = "data/pilot_v0/candidate_truth.jsonl"
 
 
-def sheet_rows(units: list[dict]) -> str:
+def sheet_rows(units: list[dict], prefix: str = "") -> str:
     """Write a human's answers back in the sheet's own row format.
 
-    The annotation is re-rendered from the truth only so the test has
-    something to fill in; the point of the test is the path, not the labels.
+    The label skeleton is re-rendered from the truth only so the test has
+    something to fill in; the point is the path, not the labels.  ``prefix``
+    stands in for each annotator's own wording — the freezer now checks
+    content, so a fixture that copies the generator text verbatim is
+    correctly refused as laundered truth.
     """
     rows = []
     for unit in units:
@@ -51,9 +54,14 @@ def sheet_rows(units: list[dict]) -> str:
         tags = ",".join(unit.get("rule_tags") or [])
         rows.append(
             f"{turns} | {TYPE_CODES[unit['type']]} | {unit['scope']} | "
-            f"{CATEGORY_CODES[unit['category']]} | {unit['text']} | {note} | {tags}"
+            f"{CATEGORY_CODES[unit['category']]} | {prefix}{unit['text']} | {note} | {tags}"
         )
     return "\n".join(rows)
+
+
+# One-character paraphrases: enough to make the wording the annotator's own,
+# short enough to stay above the scorer's 0.08 anchor-coverage floor.
+PREFIXES = {"A": "按", "B": "依"}
 
 
 class AnnotationPipelineTests(unittest.TestCase):
@@ -77,7 +85,10 @@ class AnnotationPipelineTests(unittest.TestCase):
             path = out / f"{row['dialogue_id']}.md"
             text = path.read_text(encoding="utf-8")
             path.write_text(
-                text.replace(ANSWER_START, ANSWER_START + "\n" + sheet_rows(units) + "\n"),
+                text.replace(
+                    ANSWER_START,
+                    ANSWER_START + "\n" + sheet_rows(units, PREFIXES[annotator]) + "\n",
+                ),
                 encoding="utf-8",
             )
         return out
@@ -88,8 +99,8 @@ class AnnotationPipelineTests(unittest.TestCase):
             sheets_a = self._fill(root, "A")
             sheets_b = self._fill(root, "B", drift=True)
 
-            parsed_a = parse_sheets(sheets_a, annotator="A")
-            parsed_b = parse_sheets(sheets_b, annotator="B")
+            parsed_a = parse_sheets(sheets_a, annotator="A", provenance="human")
+            parsed_b = parse_sheets(sheets_b, annotator="B", provenance="human")
 
             # The parse must be clean and must actually carry units.
             self.assertEqual(parsed_a["problems"], [])
@@ -127,6 +138,7 @@ class AnnotationPipelineTests(unittest.TestCase):
                 report,
                 resolutions,
                 root / "gold",
+                annotations_b=parsed_b["annotations"],
             )
             self.assertEqual(manifest["gold_provenance"], "human")
             self.assertEqual(manifest["annotator_n"], 2)
@@ -161,14 +173,20 @@ class AnnotationPipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             sheets_a = self._fill(root, "A")
-            parsed_a = parse_sheets(sheets_a, annotator="A")
+            parsed_a = parse_sheets(sheets_a, annotator="A", provenance="human")
+            rows_b = copy.deepcopy(parsed_a["annotations"])
+            # Same pen, slightly different wording: content identity is a
+            # separate (earlier) gate, so keep it distinct to reach the
+            # "two independent annotators" check this test is about.
+            rows_b[0]["annotations"][0]["text"] += "（补记）"
             report = agreement_report(
-                parsed_a["annotations"], copy.deepcopy(parsed_a["annotations"]), bootstrap_n=50
+                parsed_a["annotations"], rows_b, bootstrap_n=50
             )
             self.assertEqual(report["annotator_n"], 1)
             with self.assertRaises(ValueError) as caught:
                 freeze_gold(
-                    read_jsonl(WORKSHEET), parsed_a["annotations"], report, [], root / "gold"
+                    read_jsonl(WORKSHEET), parsed_a["annotations"], report, [],
+                    root / "gold", annotations_b=rows_b,
                 )
             self.assertIn("independent annotators", str(caught.exception))
 

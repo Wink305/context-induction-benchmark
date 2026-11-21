@@ -72,6 +72,32 @@ class SheetRenderTest(unittest.TestCase):
             self.assertNotIn(value, leaked_region, f"gold text {value!r} leaked into the sheet example")
         self.assertIn("虚构对话", leaked_region)
 
+    def test_example_is_not_a_pilot_shape(self):
+        """The demo must not teach the pilot's own answers.
+
+        The old example reproduced p0-001's c001 in type/scope/category/tag
+        and taught the "three mentions -> I + R2" rule that hits 16 real
+        units.  Both would inflate kappa by teaching the answers.
+        """
+        text = render_sheet(
+            read_jsonl("data/pilot_v0/candidate_truth.jsonl")[0],
+            index=1, total=5, calibration=True, annotator="A",
+        )
+        demo = text.split("## 三、答案区", 1)[-1].split("在下面两行注释", 1)[0]
+        example_rows = demo.split("示例：", 1)[-1].split("```")[1]
+        # An unrelated domain: none of these words occurs in the pilot's
+        # unit texts or turns (checked against the shipped data).
+        for word in ("打印", "报销", "凭证", "会议室", "碳粉", "内部系统"):
+            self.assertIn(word, demo)
+        for word in ("旅行", "退款", "住宿", "餐饮", "预约电话", "工单升级"):
+            self.assertNotIn(word, demo)
+        # The field guide may explain R2, but the demo rows must not
+        # demonstrate the count-to-three judgment that hits 16 pilot units.
+        self.assertNotIn("R2", example_rows)
+        self.assertIn("R5", example_rows)  # a different I justification
+        for code in ("S", "O", "I", "T"):
+            self.assertIn(f"| {code} |", example_rows)
+
     def test_worksheet_without_truth_never_produces_structural_hints(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -349,6 +375,69 @@ class RoundTripTest(unittest.TestCase):
             # The id must satisfy the model-output contract (c<number>), so
             # the annotation can be frozen and scored like a prediction.
             self.assertRegex(record["id"], r"^c\d+$")
+
+
+class SheetProvenanceTest(unittest.TestCase):
+    """Reading a sheet is not evidence that a human wrote the answers."""
+
+    @staticmethod
+    def _sheet_dir(root: Path, *, manifest_provenance: str | None = None) -> Path:
+        out = root / "sheets"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "p0-900.md").write_text(
+            wrap("1 | S | global | C | 仅用邮件 |"), encoding="utf-8"
+        )
+        if manifest_provenance is not None:
+            (out / "_manifest.json").write_text(
+                '{"provenance": "' + manifest_provenance + '"}', encoding="utf-8"
+            )
+        return out
+
+    def test_no_declaration_resolves_to_unknown_not_human(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parsed = parse_sheets(self._sheet_dir(Path(tmp)), annotator="A")
+            self.assertEqual(parsed["provenance"], "unknown")
+            row = parsed["annotations"][0]
+            self.assertEqual(row["provenance"], "unknown")
+            self.assertNotEqual(row["annotations"][0]["note"], "human annotation")
+
+    def test_explicit_declaration_is_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parsed = parse_sheets(
+                self._sheet_dir(Path(tmp)), annotator="A", provenance="human"
+            )
+            self.assertEqual(parsed["provenance"], "human")
+            self.assertEqual(parsed["annotations"][0]["provenance"], "human")
+            self.assertEqual(
+                parsed["annotations"][0]["annotations"][0]["note"], "human annotation"
+            )
+
+    def test_manifest_declaration_is_inherited(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parsed = parse_sheets(
+                self._sheet_dir(Path(tmp), manifest_provenance="ai_precheck"),
+                annotator="A",
+            )
+            self.assertEqual(parsed["provenance"], "ai_precheck")
+            self.assertEqual(parsed["annotations"][0]["provenance"], "ai_precheck")
+            self.assertNotIn("human", parsed["annotations"][0]["annotations"][0]["note"])
+
+    def test_rendering_manifest_claims_no_human_origin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worksheet = root / "worksheet.jsonl"
+            write_jsonl(worksheet, [{
+                "dialogue_id": "p0-901",
+                "status": "awaiting_independent_annotation",
+                "turns": [{"turn": 1, "speaker": "user", "text": "以后只用邮件"}],
+                "annotations": [],
+            }])
+            out = root / "sheets"
+            manifest = make_sheets(worksheet, out, annotator="A")
+            self.assertEqual(manifest["provenance"], "unannotated_sheets")
+            self.assertEqual(read_json(out / "_manifest.json")["provenance"], "unannotated_sheets")
+            # A freshly rendered, still-empty directory parses as unknown.
+            self.assertEqual(parse_sheets(out, annotator="A")["provenance"], "unknown")
 
 
 if __name__ == "__main__":

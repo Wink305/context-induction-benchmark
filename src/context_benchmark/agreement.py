@@ -9,7 +9,7 @@ from typing import Any
 from .ontology import TYPE_TO_CODE
 from .provenance import classify_annotator
 from .scoring import greedy_match, ratio
-from .validation import row_units
+from .validation import annotation_content_hash, row_units
 
 
 def cohen_kappa(labels_a: list[str], labels_b: list[str]) -> dict[str, Any]:
@@ -311,9 +311,36 @@ def agreement_report(
     ]
     annotator_labels = [str(label).strip() for label in annotator_labels if str(label).strip()]
     annotator_type = classify_annotator(annotator_labels)
+    # A perfect kappa with no conflicts and no extraction disagreement can be
+    # genuine agreement — or it can be one person labelling the same set twice
+    # under two names.  Flag it, do not fail on it: a small clean corpus may
+    # legitimately reach 1.0, and the freezer has a stronger content-identity
+    # check for the copy case.  What matters here is that a downstream reader
+    # cannot mistake a vacuous agreement measurement for a measured one.
+    unmatched_n = extraction["unmatched_a_n"] + extraction["unmatched_b_n"]
+    suspect_self_agreement = (
+        overall["kappa"] == 1.0
+        and not adjudication
+        and not unmatched_n
+        and bool(labels_a)
+    )
     return {
         "method": "all_units_cohen_kappa_with_absent_class_dialogue_cluster_bootstrap",
         "matcher_calibrated": False,
+        # Bind this report to the exact annotation sets it was computed from.
+        # Without these hashes a hand-written report with fabricated gate
+        # results is indistinguishable from a real one at the freeze gate.
+        "annotations_a_sha256": annotation_content_hash(rows_a),
+        "annotations_b_sha256": annotation_content_hash(rows_b),
+        "suspect_self_agreement": suspect_self_agreement,
+        "suspect_self_agreement_note": (
+            "The two annotation sets produced perfect agreement with no conflicts and no "
+            "extraction disagreements. This may be genuine, or one person labelling twice "
+            "under two names. Reported as a warning only; the freeze gate compares the two "
+            "sets by content."
+            if suspect_self_agreement
+            else "No vacuous-agreement pattern detected."
+        ),
         "aligned_unit_n": len(aligned),
         "unmatched_a_n": extraction["unmatched_a_n"],
         "unmatched_b_n": extraction["unmatched_b_n"],

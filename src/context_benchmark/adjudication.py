@@ -5,9 +5,21 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Iterator
 
-from .io import sha256_file, write_json, write_jsonl
-from .provenance import collect_generator_findings, collect_provenance_findings, normalize_value
-from .validation import public_constraint, row_units, validate_output
+from .agreement import agreement_report
+from .io import read_jsonl, sha256_file, write_json, write_jsonl
+from .provenance import (
+    collect_generator_findings,
+    collect_provenance_findings,
+    generator_truth_laundering,
+    normalize_value,
+)
+from .validation import (
+    annotation_content_hash,
+    public_constraint,
+    row_units,
+    truth_rows_as_annotations,
+    validate_output,
+)
 
 CORE_EXIT_CHECKS = (
     "overall_kappa_gte_0_70", "overall_ci_lower_gte_0_60", "per_type_pass",
@@ -34,6 +46,7 @@ def _assert_human_provenance(
     agreement: dict[str, Any],
     resolutions: list[dict[str, Any]],
     candidate_dialogues: list[dict[str, Any]],
+    annotations_b: list[dict[str, Any]] | None = None,
 ) -> None:
     """Refuse to freeze anything that is not provably human annotation.
 
@@ -66,6 +79,10 @@ def _assert_human_provenance(
     """
     marker_sources = (
         ("adjudicated_annotations", adjudicated_annotations),
+        # The second annotator's set is just as capable of carrying a
+        # generator/AI claim as the first one.  Scanning only the baseline
+        # would let a clean A set certify a machine-produced B set.
+        ("annotations_b", annotations_b or []),
         ("agreement_report", agreement),
         ("resolutions", resolutions),
         # The dialogue source is scanned for provenance too, not only for
@@ -116,15 +133,16 @@ def _assert_human_provenance(
     # Last, because it is the generic diagnosis: if the payload had said
     # anything about its origin — AI, generator — the specific check above
     # would already have named the real problem.
+    all_annotation_rows = list(adjudicated_annotations) + list(annotations_b or [])
     undeclared = [
         row.get("dialogue_id")
-        for row in adjudicated_annotations
+        for row in all_annotation_rows
         if isinstance(row, dict) and normalize_value(row.get("provenance")) != HUMAN_PROVENANCE
     ]
     if undeclared:
         raise ValueError(
             "Refusing to freeze gold: the annotation payload does not declare a human origin. "
-            f"{len(undeclared)} of {len(adjudicated_annotations)} rows lack "
+            f"{len(undeclared)} of {len(all_annotation_rows)} rows lack "
             f"provenance={HUMAN_PROVENANCE!r} (first: {undeclared[0]!r}). The freezer will not "
             "stamp a human gold claim that nobody declared."
         )
@@ -173,6 +191,37 @@ def _apply_resolutions(
     return [slots[key] for key in sorted(slots)]
 
 
+def _agreement_gate_facts(report: dict[str, Any]) -> dict[str, Any]:
+    """The part of an agreement report that decides whether gold may freeze.
+
+    Only gate-relevant fields take part.  Free-text warnings, notes and the
+    informational AC1 are deliberately left out: they may be reworded
+    without changing a single verdict.
+    """
+    queue = [
+        (
+            conflict.get("conflict_id"),
+            tuple(conflict.get("reasons") or []),
+            conflict.get("a_index"),
+            conflict.get("b_index"),
+        )
+        for conflict in (report.get("adjudication_queue") or [])
+        if isinstance(conflict, dict)
+    ]
+    overall = report.get("overall") or {}
+    return {
+        "unit_n": report.get("unit_n"),
+        "overall_kappa": overall.get("kappa"),
+        "overall_ci": overall.get("ci_95_percentile_cluster_bootstrap"),
+        "exit_checks": report.get("exit_checks"),
+        "annotator_n": report.get("annotator_n"),
+        "annotator_type": report.get("annotator_type"),
+        "annotator_labels": report.get("annotator_labels"),
+        "boundary_assessed": report.get("boundary_assessed"),
+        "adjudication_queue": queue,
+    }
+
+
 def freeze_gold(
     candidate_dialogues: list[dict[str, Any]],
     adjudicated_annotations: list[dict[str, Any]],
@@ -181,6 +230,9 @@ def freeze_gold(
     output_dir: str | Path,
     *,
     gold_provenance: str = HUMAN_PROVENANCE,
+    annotations_b: list[dict[str, Any]] | None = None,
+    distractor_source: str | Path | None = None,
+    generator_truth_paths: tuple[str | Path, ...] = (),
 ) -> dict[str, Any]:
     """Freeze gold after independent agreement and applied human resolutions.
 
@@ -195,6 +247,22 @@ def freeze_gold(
     evidence of an AI / generator origin (see :func:`_assert_human_provenance`).
     The declared provenance is recorded in the frozen manifest so a later
     claim can be checked against what was actually declared.
+
+    The freezer does not trust a supplied agreement report on its word:
+
+    * the second annotator's annotation set is required, because an
+      agreement measurement computed from one set copied twice is vacuous;
+    * the report must carry content hashes of both sets, and those hashes
+      must match what the freezer sees;
+    * the report is recomputed from the two sets and cross-checked on every
+      gate-relevant field;
+    * both the input annotations and the post-adjudication gold are checked
+      against the shipped generator truth **by content**, so deleting the
+      generator's marker fields cannot launder its labels into human gold.
+
+    ``distractor_source`` supplies the negative-side items (``distractors``,
+    ``non_units``).  They are rule-audited dataset artifacts, not human
+    annotations, and the manifest says so explicitly.
     """
     declared = normalize_value(gold_provenance)
     if declared != HUMAN_PROVENANCE:
@@ -203,7 +271,64 @@ def freeze_gold(
             f"{HUMAN_PROVENANCE!r}. Only human-adjudicated annotations may be frozen "
             "as human gold."
         )
-    _assert_human_provenance(adjudicated_annotations, agreement, resolutions, candidate_dialogues)
+    # 1. A second annotation set is a prerequisite, not a convenience.
+    if annotations_b is None:
+        raise ValueError(
+            "Refusing to freeze gold: the second annotator's annotation set is required; "
+            "agreement cannot be verified without it."
+        )
+    rows_a = list(adjudicated_annotations)
+    rows_b = list(annotations_b)
+    # 2. Bind the report to the exact annotation sets it claims to describe.
+    #    A fabricated report can copy the gate numbers, but it cannot invent
+    #    the content hash of annotations the freezer has never seen.
+    if not isinstance(agreement, dict):
+        raise ValueError("Refusing to freeze gold: the agreement report must be a JSON object")
+    expected_a = annotation_content_hash(rows_a)
+    expected_b = annotation_content_hash(rows_b)
+    if (
+        agreement.get("annotations_a_sha256") != expected_a
+        or agreement.get("annotations_b_sha256") != expected_b
+    ):
+        raise ValueError(
+            "Refusing to freeze gold: the agreement report is not bound to the annotation "
+            "sets it claims to describe (annotations_a_sha256 / annotations_b_sha256 do not "
+            "match the sets supplied to the freezer). Regenerate the report with agreement."
+        )
+    # 3. Recompute the gate from the raw sets.  Reusing the report's own
+    #    bootstrap_n matters: a different resample count changes the CI lower
+    #    bound and would reject a perfectly valid report.
+    bootstrap_n = (agreement.get("overall") or {}).get("bootstrap_n", 1000)
+    if not isinstance(bootstrap_n, int) or isinstance(bootstrap_n, bool) or bootstrap_n < 1:
+        raise ValueError(
+            "Refusing to freeze gold: the agreement report does not declare a usable bootstrap_n"
+        )
+    recomputed = agreement_report(rows_a, rows_b, bootstrap_n=bootstrap_n)
+    if _agreement_gate_facts(recomputed) != _agreement_gate_facts(agreement):
+        raise ValueError(
+            "Refusing to freeze gold: the supplied agreement report does not match a "
+            "recomputation from the two annotation sets (kappa, CI, exit checks, annotators "
+            "or the adjudication queue differ)."
+        )
+    # 4. Two annotation sets with identical content are not an agreement
+    #    measurement — they are one set copied twice, whatever the names say.
+    if expected_a == expected_b:
+        raise ValueError(
+            "Refusing to freeze gold: the two annotation sets are byte-identical in content. "
+            "Agreement between copies is vacuous; two annotators must write their own labels."
+        )
+    # 5. Content-level origin check on the baseline, before any laundering
+    #    through note/status editing can be considered human.
+    laundering_a = generator_truth_laundering(rows_a, extra_paths=generator_truth_paths)
+    if laundering_a["laundered"]:
+        raise ValueError(
+            "Refusing to freeze gold: the annotation content is the shipped generator truth "
+            f"({laundering_a['whole_set_match_path'] or laundering_a['max_overlap_path']}). "
+            "It is generator truth, not human annotation."
+        )
+    _assert_human_provenance(
+        adjudicated_annotations, agreement, resolutions, candidate_dialogues, rows_b
+    )
     # Agreement needs two *independent* annotators.  One person labelling the
     # same set twice produces a perfect kappa and would otherwise certify
     # its own consistency as if it were a double-blind measurement.
@@ -273,6 +398,44 @@ def freeze_gold(
     rows_by_id = {row["dialogue_id"]: row for row in resolved}
     if set(rows_by_id) != {row["dialogue_id"] for row in candidate_dialogues}:
         raise ValueError("Adjudicated annotations must cover exactly every dialogue")
+    # The adjudications themselves must not turn a human set back into a copy
+    # of generator truth: the post-resolution gold is what actually ships.
+    resolved_rows = [
+        {"dialogue_id": did, "annotations": row["annotations"]}
+        for did, row in rows_by_id.items()
+    ]
+    laundering_gold = generator_truth_laundering(
+        resolved_rows, extra_paths=generator_truth_paths
+    )
+    if laundering_gold["laundered"]:
+        raise ValueError(
+            "Refusing to freeze gold: the post-adjudication gold content is the shipped "
+            f"generator truth ({laundering_gold['whole_set_match_path'] or laundering_gold['max_overlap_path']}). "
+            "Adjudication cannot turn generator labels into human gold."
+        )
+    # Negative-side items (distractors / non-units) are rule-audited dataset
+    # artifacts, not human annotations.  They must be carried explicitly:
+    # without them FMR is undefined and the FAA denominator silently shrinks.
+    distractor_path = Path(distractor_source) if distractor_source is not None else None
+    distractors_by_id: dict[str, dict[str, Any]] = {}
+    if distractor_path is not None:
+        if not distractor_path.is_file():
+            raise ValueError(
+                f"Refusing to freeze gold: distractor_source {distractor_path} does not exist"
+            )
+        for row in read_jsonl(distractor_path):
+            distractors_by_id[row["dialogue_id"]] = {
+                "distractors": row.get("distractors") or [],
+                "non_units": row.get("non_units") or [],
+            }
+        missing = [
+            dialogue["dialogue_id"] for dialogue in candidate_dialogues
+            if dialogue["dialogue_id"] not in distractors_by_id
+        ]
+        if missing:
+            raise ValueError(
+                f"Refusing to freeze gold: distractor_source does not cover {sorted(missing)}"
+            )
     target = Path(output_dir)
     gold_path = target / "gold_v1.jsonl"
     manifest_path = target / "gold_manifest.json"
@@ -297,6 +460,10 @@ def freeze_gold(
             # fields above.
             "candidate_truth": annotations,
             "constraints": annotations,
+            # Negative-side items travel with the gold so the scorer can
+            # compute FMR and use the full forget-set denominator.
+            "distractors": distractors_by_id.get(dialogue["dialogue_id"], {}).get("distractors", []),
+            "non_units": distractors_by_id.get(dialogue["dialogue_id"], {}).get("non_units", []),
         })
     write_jsonl(gold_path, gold_rows)
     manifest = {
@@ -312,6 +479,25 @@ def freeze_gold(
         "boundary_assessed": agreement.get("boundary_assessed"),
         "gold_sha256": sha256_file(gold_path),
         "agreement_summary": {key: value for key, value in agreement.items() if key != "adjudication_queue"},
+        "agreement_recomputed_by_freezer": True,
+        "suspect_self_agreement": agreement.get("suspect_self_agreement"),
+        "content_laundering_check": {
+            "baseline_annotations": laundering_a,
+            "frozen_gold": laundering_gold,
+        },
+        "distractor_set": "present" if distractor_path is not None else "absent",
+        "distractor_source": str(distractor_path) if distractor_path is not None else None,
+        "distractor_source_sha256": sha256_file(distractor_path) if distractor_path is not None else None,
+        "distractor_n": sum(len(row["distractors"]) for row in gold_rows),
+        "distractor_provenance": (
+            "dataset_truth_not_human_annotated" if distractor_path is not None else "none_attached"
+        ),
+        "distractor_note": (
+            "Negative-side items are carried from the rule-audited dataset; they are NOT human "
+            "annotations. The human_gold claim covers the positive constraint labels only."
+            if distractor_path is not None
+            else "No negative-side items were attached; FMR is undefined for this gold set."
+        ),
         "immutability": "Any content change requires a new gold version; never overwrite this file",
     }
     write_json(manifest_path, manifest)

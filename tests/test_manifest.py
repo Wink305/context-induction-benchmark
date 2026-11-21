@@ -3,9 +3,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from context_benchmark.io import read_json, sha256_file, write_json, write_jsonl
+from context_benchmark.io import read_json, read_jsonl, sha256_file, write_json, write_jsonl
 from context_benchmark.manifest import (
-    REPO_ROOT, build_dataset_manifest, build_run_manifest, validate_submission,
+    REPO_ROOT, _normalize_kappa_map, build_dataset_manifest, build_run_manifest,
+    validate_submission,
 )
 
 BENCHMARK_CONFIG = Path(__file__).resolve().parents[1] / "configs/benchmark.json"
@@ -163,6 +164,61 @@ class RunSubmissionTests(unittest.TestCase):
         write_json(self.package / "submission.json", document)
         codes = _codes(self.validate())
         self.assertIn("fake_human_gold", codes)
+
+    def test_laundered_generator_truth_is_rejected_by_content(self):
+        """Deleting the markers must not change the verdict.
+
+        This is the attack the marker-level gate could not catch: rename the
+        truth file to gold.jsonl, set status to "annotated", rewrite every
+        note to "human annotation", and delete candidate_only.  The 420
+        labels are still the generator's, word for word.
+        """
+        source = read_jsonl("data/pilot_v0/candidate_truth.jsonl")
+        gold_rows = []
+        for row in source:
+            cleaned = dict(row)
+            cleaned["status"] = "annotated"
+            for unit in cleaned["candidate_truth"]:
+                unit.pop("candidate_only", None)
+                unit["note"] = "human annotation"
+            gold_rows.append(cleaned)
+        gold = self.package / "gold.jsonl"
+        write_jsonl(gold, gold_rows)
+        report = self.package / "annotation_report.json"
+        write_json(report, {
+            "annotator_type": "human", "annotator_n": 2, "unit_n": 420,
+            "overall_kappa": 0.88,
+            "per_class_kappa": {"standing": 0.91, "one_off": 0.84},
+            "kappa_ci_lower": 0.80, "ac1": 0.89,
+            "adjudication_method": "third_reviewer_decision_per_conflict",
+        })
+        document = read_json(self.package / "submission.json")
+        document["files"]["gold.jsonl"] = sha256_file(gold)
+        document["files"]["annotation_report.json"] = sha256_file(report)
+        document["dataset"]["evidence_grade"] = "human_gold"
+        document["dataset"]["human_annotation_complete"] = True
+        document["dataset"]["gold_version"] = "v1.0"
+        document["dataset"]["gold_sha256"] = sha256_file(gold)
+        document["dataset"]["annotation_report_file"] = "annotation_report.json"
+        write_json(self.package / "submission.json", document)
+        result = self.validate()
+        self.assertIn("fake_human_gold", _codes(result))
+        detail = next(
+            issue["message"] for issue in result["issues"]
+            if issue["code"] == "fake_human_gold"
+        )
+        self.assertIn("candidate_truth.jsonl", detail)
+        self.assertIn("byte-identical", detail)
+
+    def test_ac1_is_not_published_as_per_class_kappa(self):
+        """AC1 is reported only; it must never wear kappa's label."""
+        self.assertEqual(_normalize_kappa_map({"implicit": {"gwet_ac1": 0.92}}), {})
+        self.assertEqual(_normalize_kappa_map({"implicit": {"ac1": 0.92}}), {})
+        # A real kappa still parses.
+        self.assertEqual(
+            _normalize_kappa_map({"implicit": {"kappa": 0.81, "gwet_ac1": 0.95}}),
+            {"implicit": 0.81},
+        )
 
     def test_a_frozen_gold_file_is_not_mistaken_for_generator_output(self):
         """The frozen gold carries candidate_truth; that is a file format."""

@@ -9,6 +9,7 @@ from context_benchmark.agreement import (
     gwet_ac1,
 )
 from context_benchmark.io import read_jsonl
+from context_benchmark.validation import annotation_content_hash
 
 
 class AgreementTests(unittest.TestCase):
@@ -231,6 +232,39 @@ class KappaOnlyGateTests(unittest.TestCase):
             row["annotator"] = "AI-precheck"
         ai = agreement_report(ai_rows, copy.deepcopy(ai_rows), bootstrap_n=20)
         self.assertEqual(ai["annotator_type"], "ai_precheck")
+
+
+    def test_report_binds_the_annotation_sets_by_content_hash(self):
+        """A report must name the exact bytes it was computed from.
+
+        This is what stops a hand-written agreement report from being used
+        to freeze generator truth: the freezer recomputes both hashes and
+        refuses a report that does not match.
+        """
+        rows_a = self.annotations()
+        rows_b = self.annotations()
+        rows_b[0]["annotations"][0]["text"] += "（人工改写）"
+        report = agreement_report(rows_a, rows_b, bootstrap_n=20)
+        self.assertEqual(report["annotations_a_sha256"], annotation_content_hash(rows_a))
+        self.assertEqual(report["annotations_b_sha256"], annotation_content_hash(rows_b))
+        self.assertNotEqual(report["annotations_a_sha256"], report["annotations_b_sha256"])
+
+    def test_perfect_agreement_is_flagged_but_not_failed(self):
+        """A vacuous agreement measurement is visible, yet still not a gate."""
+        rows = self.annotations()
+        perfect = agreement_report(rows, copy.deepcopy(rows), bootstrap_n=50)
+        self.assertEqual(perfect["overall"]["kappa"], 1.0)
+        self.assertTrue(perfect["suspect_self_agreement"])
+        self.assertIn("labelling twice", perfect["suspect_self_agreement_note"])
+        # A flag is not a verdict: the exit checks are unchanged.
+        self.assertTrue(perfect["gold_freeze_allowed"])
+
+        rows_b = self.annotations()
+        rows_b[0]["annotations"][0]["type"] = "one_off"
+        rows_b[0]["annotations"][0]["scope"] = "task"
+        with_conflict = agreement_report(rows, rows_b, bootstrap_n=50)
+        self.assertFalse(with_conflict["suspect_self_agreement"])
+        self.assertFalse(with_conflict["gold_freeze_allowed"])
 
 
 if __name__ == "__main__":

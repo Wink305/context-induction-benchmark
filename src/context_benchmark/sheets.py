@@ -20,7 +20,7 @@ import re
 from pathlib import Path
 from typing import Any, Iterable
 
-from .io import read_jsonl, write_json, write_jsonl
+from .io import read_json, read_jsonl, write_json, write_jsonl
 
 ANSWER_START = "<!-- ANSWER_START -->"
 ANSWER_END = "<!-- ANSWER_END -->"
@@ -28,6 +28,13 @@ ANSWER_END = "<!-- ANSWER_END -->"
 # The only hint an answer-free sheet may carry.  It is identical for every
 # segment and says nothing about whether the segment holds constraints.
 NEUTRAL_HINT = "按《P0_标注手册_v1.md》逐条判断用户侧约束；只标能确定是约束的条目。"
+
+# Rendering a sheet happens *before* anyone annotates it, so the renderer
+# cannot claim a human origin for the answers.  A directory that does not
+# say where its answers came from stays "unknown" — never silently promoted
+# to "human" just because a parser read it.
+UNANNOTATED_SHEETS = "unannotated_sheets"
+UNKNOWN_PROVENANCE = "unknown"
 
 TYPE_ALIASES = {
     "s": "standing",
@@ -245,7 +252,9 @@ def _link_superseded(records: list[dict[str, Any]], problems: list[str]) -> None
         record.pop("_replaced_turn", None)
 
 
-def finalize_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def finalize_records(
+    records: list[dict[str, Any]], provenance: str = UNKNOWN_PROVENANCE
+) -> list[dict[str, Any]]:
     """Give every parsed unit the identifiers the output contract requires.
 
     The id is ``c<number>`` and unique **within its dialogue**, exactly like
@@ -257,7 +266,10 @@ def finalize_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     for index, record in enumerate(records, start=1):
         record["id"] = f"c{index:03d}"
-        record.setdefault("note", "human annotation")
+        # The note used to be stamped "human annotation" unconditionally,
+        # which let an AI pre-check directory parse into rows claiming a
+        # human origin.  The note now reflects the declared source.
+        record.setdefault("note", f"{provenance} annotation")
         # The boundary tags arrive under a private key so a malformed cell
         # cannot silently become an empty list.  They are the annotator's own
         # boundary judgement, carried into the agreement gate.
@@ -352,15 +364,16 @@ def render_sheet(
 > 下面的例子是一段**虚构对话**的格式演示，轮次和内容都与你手上的题目无关，
 > 照抄不会得到任何分数。请只把它当作「一行该长什么样」的参考。
 >
-> 虚构对话：第 2 轮用户说「以后文件都用蓝色封面」，第 8 轮说「蓝色封面那条取消」；
-> 第 4、6、10 轮用户三次说「附件别超过两页」；
-> 第 3 轮和第 9 轮各说一次「发邮件就行，别打电话」。
+> 虚构对话：第 2 轮用户说「以后办公区打印默认双面黑白」；
+> 第 5 轮说「这次报销只收电子凭证，纸质不算」；
+> 第 3、7、11 轮分别提到「新同事对碳粉味敏感」「打印房通风不好」「闻到碳粉会头疼」；
+> 第 4 轮说「会议室预约先按老办法走」，第 9 轮说「老办法作废，统一用内部系统」。
 示例：
 ```
-3,9 | S | global | C | 只用邮件联系 |  | R8
-2 | S | global | D | 文件用蓝色封面 |  | 
-2,8 | T | global | D | 文件用蓝色封面 | 8 | R3
-4,6,10 | I | global | P | 附件不超过两页 |  | R2
+2 | S | global | D | 打印默认双面黑白 |  | 
+5 | O | task | P | 本次报销只收电子凭证 |  | 
+3,7,11 | I | global | D | 打印房避开碳粉 |  | R5
+4,9 | T | global | P | 会议室走旧预约办法 | 9 | R7
 ```
 
 在下面两行注释之间逐行填写，不要删除注释标记：
@@ -432,6 +445,10 @@ def make_sheets(
         created.append(str(path))
     manifest = {
         "annotator": annotator,
+        # Rendering is not annotation.  Recording this here prevents the
+        # parser from treating a freshly rendered, still-empty sheet set as
+        # evidence that a human produced the answers.
+        "provenance": UNANNOTATED_SHEETS,
         "sheets": len(created),
         "calibration": sorted(cal & {d["dialogue_id"] for d in dialogues}),
         "hints_from_truth": truth_path is not None,
@@ -441,8 +458,33 @@ def make_sheets(
     return manifest
 
 
-def parse_sheets(sheet_dir: str | Path, annotator: str = "A") -> dict[str, Any]:
+def _resolve_sheet_provenance(directory: Path, provenance: str | None) -> str:
+    """Where the answers came from, as declared by a party who knows.
+
+    Explicit declaration wins.  Otherwise the rendering manifest is checked:
+    ``unannotated_sheets`` means the renderer produced the directory, not a
+    human, so it is *not* a provenance claim for the answers.  Anything
+    undeclared resolves to ``unknown`` — an unknown origin is never promoted
+    to ``human`` by the mere act of parsing the files.
+    """
+    if provenance is not None and str(provenance).strip():
+        return str(provenance).strip()
+    manifest_path = directory / "_manifest.json"
+    if manifest_path.is_file():
+        try:
+            declared = (read_json(manifest_path) or {}).get("provenance")
+        except (OSError, ValueError):
+            declared = None
+        if isinstance(declared, str) and declared.strip() and declared.strip() != UNANNOTATED_SHEETS:
+            return declared.strip()
+    return UNKNOWN_PROVENANCE
+
+
+def parse_sheets(
+    sheet_dir: str | Path, annotator: str = "A", provenance: str | None = None
+) -> dict[str, Any]:
     directory = Path(sheet_dir)
+    resolved_provenance = _resolve_sheet_provenance(directory, provenance)
     paths = sorted(p for p in directory.glob("*.md"))
     annotations: list[dict[str, Any]] = []
     problems: list[dict[str, Any]] = []
@@ -472,14 +514,15 @@ def parse_sheets(sheet_dir: str | Path, annotator: str = "A") -> dict[str, Any]:
                         "question": question,
                     }
                 )
-        records = finalize_records(records)
+        records = finalize_records(records, resolved_provenance)
         annotations.append(
             {
                 "dialogue_id": dialogue_id,
                 "annotator": annotator,
                 "status": "annotated",
-                # The human filled the sheet, so that is what this row claims.
-                "provenance": "human",
+                # Only a declared origin may be claimed here. Parsing a
+                # directory is not evidence that a human filled it in.
+                "provenance": resolved_provenance,
                 # ``annotations`` is the contract key.  The worksheet, the
                 # agreement gate and the adjudication gate all read it; a
                 # previous version emitted ``constraints`` here and the whole
@@ -492,6 +535,7 @@ def parse_sheets(sheet_dir: str | Path, annotator: str = "A") -> dict[str, Any]:
         )
     return {
         "annotator": annotator,
+        "provenance": resolved_provenance,
         "sheet_n": len(paths),
         "annotated_n": len([row for row in annotations if row["annotations"]]),
         "empty_sheets": empty,

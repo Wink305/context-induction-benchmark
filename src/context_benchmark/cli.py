@@ -232,8 +232,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Truth-free annotation worksheet (data/pilot_v0/annotation_worksheet.jsonl). "
              "Generator truth is refused: it carries candidate_only markers.",
     )
-    freeze.add_argument("--annotations", required=True)
+    freeze.add_argument("--annotations", required=True, help="Annotator A's parsed annotation set")
+    freeze.add_argument(
+        "--annotations-b", required=True,
+        help="Annotator B's parsed annotation set. Agreement between a set and itself is "
+             "vacuous, so the freezer refuses to run without this.",
+    )
     freeze.add_argument("--agreement-report", required=True)
+    freeze.add_argument(
+        "--distractors",
+        help="Truth file carrying the rule-audited distractors / non_units to attach to the "
+             "frozen gold. Without it the negative side is absent and FMR is undefined.",
+    )
     freeze.add_argument("--resolutions", required=True, help="JSON list of explicit third-reviewer decisions")
     freeze.add_argument("--output-dir", required=True)
 
@@ -274,6 +284,11 @@ def build_parser() -> argparse.ArgumentParser:
     parse = sub.add_parser("parse-sheets", help="Parse filled annotation sheets into annotation records")
     parse.add_argument("--dir", required=True)
     parse.add_argument("--annotator", default="A")
+    parse.add_argument(
+        "--provenance", default=None,
+        help="Declared origin of these sheets (human / ai_precheck / …). Without a "
+             "declaration the parsed rows are marked unknown, never human.",
+    )
     parse.add_argument("--output", required=True)
     parse.add_argument("--report", required=True)
 
@@ -356,6 +371,8 @@ def main(argv: list[str] | None = None) -> None:
         result = freeze_gold(
             read_jsonl(args.candidate), read_jsonl(args.annotations), read_json(args.agreement_report),
             read_json(args.resolutions), args.output_dir,
+            annotations_b=read_jsonl(args.annotations_b),
+            distractor_source=args.distractors,
         )
     elif args.command == "survival":
         # Accept either a single JSON object or a JSONL trace produced by
@@ -424,7 +441,9 @@ def main(argv: list[str] | None = None) -> None:
             truth_path=args.truth,
         )
     elif args.command == "parse-sheets":
-        parsed = parse_sheets(Path(args.dir), annotator=args.annotator)
+        parsed = parse_sheets(
+            Path(args.dir), annotator=args.annotator, provenance=args.provenance
+        )
         annotations = parsed.pop("annotations")
         write_jsonl(args.output, annotations)
         write_json(args.report, parsed)

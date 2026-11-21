@@ -24,8 +24,12 @@ from typing import Any
 from . import __version__ as PACKAGE_VERSION
 from .dimensions import DIMENSION_SET_VERSION, PRIMARY_DIMENSION, validate_dimension_set
 from .io import canonical_json, read_json, read_jsonl, sha256_file, sha256_text, write_json
-from .provenance import collect_generator_findings, collect_provenance_findings
-from .validation import validate_output
+from .provenance import (
+    collect_generator_findings,
+    collect_provenance_findings,
+    generator_truth_laundering,
+)
+from .validation import truth_rows_as_annotations, validate_output
 
 DEFAULT_BENCHMARK_CONFIG = "configs/benchmark.json"
 
@@ -674,7 +678,10 @@ def _normalize_kappa_map(value: Any) -> dict[str, float]:
     for key, item in value.items():
         number: Any = None
         if isinstance(item, dict):
-            for candidate in ("kappa", "value", "ac1", "gwet_ac1"):
+            # AC1 is a different scale and never decides a gate in this
+            # repository. Accepting it here would publish a reported AC1 as
+            # if it were a per-class Cohen's kappa.
+            for candidate in ("kappa", "value"):
                 if isinstance(item.get(candidate), (int, float)) and not isinstance(item.get(candidate), bool):
                     number = item[candidate]
                     break
@@ -800,6 +807,34 @@ def _check_human_gold(
                     f"({finding['path']}={finding['value']!r}, {finding['reason']})",
                 )
                 break
+            # Markers can be deleted; the labels cannot.  Compare the gold's
+            # unit content against every generator truth file shipped in the
+            # repository.  A package that strips candidate_only, rewrites the
+            # notes and changes status still matches here.
+            try:
+                gold_rows = read_jsonl(gold_path)
+            except (ValueError, OSError):
+                gold_rows = []
+            laundering = generator_truth_laundering(
+                truth_rows_as_annotations(gold_rows), repo_root=REPO_ROOT
+            )
+            info["content_fingerprint_check"] = {
+                "reference_n": laundering["reference_n"],
+                "whole_set_match_path": laundering["whole_set_match_path"],
+                "max_overlap_ratio": laundering["max_overlap_ratio"],
+                "laundered": laundering["laundered"],
+            }
+            if laundering["laundered"]:
+                hit = laundering["whole_set_match_path"] or laundering["max_overlap_path"]
+                _issue(
+                    issues,
+                    "fake_human_gold",
+                    f"{gold_name}: the packaged gold is byte-identical to {hit} "
+                    f"(whole-set match: {laundering['whole_set_match_path'] is not None}; "
+                    f"exact dialogue overlap {laundering['max_overlap_dialogue_n']}/"
+                    f"{laundering['max_overlap_reference_dialogue_n']}, threshold "
+                    f"{laundering['overlap_threshold']}); it is generator truth, not human annotation",
+                )
 
     report_name = dataset.get("annotation_report_file")
     if isinstance(report_name, str) and report_name:
