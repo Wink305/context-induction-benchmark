@@ -1,5 +1,7 @@
 {
   "scientific_status": "validator_and_scorer_self_check_not_a_model_result",
+  "scorer_version": "scoring.py@semantic_guard_v1",
+  "matcher_version": "evidence_char_ngram_greedy_v3_text_gated_semantic_guard",
   "candidate_validation_pass_n": 40,
   "candidate_dialogue_n": 40,
   "candidate_issues": [],
@@ -142,8 +144,324 @@
     },
     "fama_macro": {
       "numerator": 35.0,
-      "denominator": 35,
-      "value": 1.0
+      "denominator": 40,
+      "value": 0.875,
+      "undefined_scored_as_zero_n": 5,
+      "denominator_policy": "all_dialogues"
     }
+  },
+  "negative_control_aggregates": {
+    "gibberish": {
+      "dialogue_n": 40,
+      "missing_prediction_dialogues": [],
+      "invalid_output_rate": {
+        "numerator": 0,
+        "denominator": 40,
+        "value": 0.0
+      },
+      "must_include": {
+        "numerator": 0,
+        "denominator": 246,
+        "value": 0.0
+      },
+      "must_exclude_absence": {
+        "numerator": 184,
+        "denominator": 184,
+        "value": 1.0
+      },
+      "overgeneralization": {
+        "numerator": 0,
+        "denominator": 174,
+        "value": 0.0
+      },
+      "fmr": {
+        "numerator": 10,
+        "denominator": 10,
+        "value": 1.0
+      },
+      "unmatched_prediction_rate": {
+        "numerator": 420,
+        "denominator": 420,
+        "value": 1.0
+      },
+      "empty_output_accuracy": {
+        "numerator": 5,
+        "denominator": 5,
+        "value": 1.0
+      },
+      "dimension_c": {
+        "superseded_type_accuracy": {
+          "numerator": 0,
+          "denominator": 61,
+          "value": 0.0
+        },
+        "expired_reuse_rate": {
+          "numerator": 0,
+          "denominator": 61,
+          "value": 0.0
+        },
+        "supersession_link_accuracy": {
+          "numerator": 0,
+          "denominator": 27,
+          "value": 0.0
+        }
+      },
+      "per_type": {
+        "standing": {
+          "tp": 0,
+          "fp": 176,
+          "fn": 176,
+          "precision": {
+            "numerator": 0,
+            "denominator": 176,
+            "value": 0.0
+          },
+          "recall": {
+            "numerator": 0,
+            "denominator": 176,
+            "value": 0.0
+          },
+          "f1": {
+            "value": 0.0,
+            "predicted_n": 176,
+            "gold_n": 176
+          }
+        },
+        "one_off": {
+          "tp": 0,
+          "fp": 113,
+          "fn": 113,
+          "precision": {
+            "numerator": 0,
+            "denominator": 113,
+            "value": 0.0
+          },
+          "recall": {
+            "numerator": 0,
+            "denominator": 113,
+            "value": 0.0
+          },
+          "f1": {
+            "value": 0.0,
+            "predicted_n": 113,
+            "gold_n": 113
+          }
+        },
+        "implicit": {
+          "tp": 0,
+          "fp": 70,
+          "fn": 70,
+          "precision": {
+            "numerator": 0,
+            "denominator": 70,
+            "value": 0.0
+          },
+          "recall": {
+            "numerator": 0,
+            "denominator": 70,
+            "value": 0.0
+          },
+          "f1": {
+            "value": 0.0,
+            "predicted_n": 70,
+            "gold_n": 70
+          }
+        },
+        "superseded": {
+          "tp": 0,
+          "fp": 61,
+          "fn": 61,
+          "precision": {
+            "numerator": 0,
+            "denominator": 61,
+            "value": 0.0
+          },
+          "recall": {
+            "numerator": 0,
+            "denominator": 61,
+            "value": 0.0
+          },
+          "f1": {
+            "value": 0.0,
+            "predicted_n": 61,
+            "gold_n": 61
+          }
+        }
+      },
+      "fama_macro": {
+        "numerator": 0.0,
+        "denominator": 40,
+        "value": 0.0,
+        "undefined_scored_as_zero_n": 5,
+        "denominator_policy": "all_dialogues"
+      }
+    },
+    "semantic_inversion": {
+      "dialogue_n": 40,
+      "missing_prediction_dialogues": [],
+      "invalid_output_rate": {
+        "numerator": 0,
+        "denominator": 40,
+        "value": 0.0
+      },
+      "must_include": {
+        "numerator": 0,
+        "denominator": 246,
+        "value": 0.0
+      },
+      "must_exclude_absence": {
+        "numerator": 184,
+        "denominator": 184,
+        "value": 1.0
+      },
+      "overgeneralization": {
+        "numerator": 0,
+        "denominator": 174,
+        "value": 0.0
+      },
+      "fmr": {
+        "numerator": 10,
+        "denominator": 10,
+        "value": 1.0
+      },
+      "unmatched_prediction_rate": {
+        "numerator": 35,
+        "denominator": 420,
+        "value": 0.08333333333333333
+      },
+      "empty_output_accuracy": {
+        "numerator": 5,
+        "denominator": 5,
+        "value": 1.0
+      },
+      "dimension_c": {
+        "superseded_type_accuracy": {
+          "numerator": 0,
+          "denominator": 61,
+          "value": 0.0
+        },
+        "expired_reuse_rate": {
+          "numerator": 0,
+          "denominator": 61,
+          "value": 0.0
+        },
+        "supersession_link_accuracy": {
+          "numerator": 27,
+          "denominator": 27,
+          "value": 1.0
+        }
+      },
+      "per_type": {
+        "standing": {
+          "tp": 0,
+          "fp": 176,
+          "fn": 176,
+          "precision": {
+            "numerator": 0,
+            "denominator": 176,
+            "value": 0.0
+          },
+          "recall": {
+            "numerator": 0,
+            "denominator": 176,
+            "value": 0.0
+          },
+          "f1": {
+            "value": 0.0,
+            "predicted_n": 176,
+            "gold_n": 176
+          }
+        },
+        "one_off": {
+          "tp": 0,
+          "fp": 113,
+          "fn": 113,
+          "precision": {
+            "numerator": 0,
+            "denominator": 113,
+            "value": 0.0
+          },
+          "recall": {
+            "numerator": 0,
+            "denominator": 113,
+            "value": 0.0
+          },
+          "f1": {
+            "value": 0.0,
+            "predicted_n": 113,
+            "gold_n": 113
+          }
+        },
+        "implicit": {
+          "tp": 0,
+          "fp": 70,
+          "fn": 70,
+          "precision": {
+            "numerator": 0,
+            "denominator": 70,
+            "value": 0.0
+          },
+          "recall": {
+            "numerator": 0,
+            "denominator": 70,
+            "value": 0.0
+          },
+          "f1": {
+            "value": 0.0,
+            "predicted_n": 70,
+            "gold_n": 70
+          }
+        },
+        "superseded": {
+          "tp": 0,
+          "fp": 61,
+          "fn": 61,
+          "precision": {
+            "numerator": 0,
+            "denominator": 61,
+            "value": 0.0
+          },
+          "recall": {
+            "numerator": 0,
+            "denominator": 61,
+            "value": 0.0
+          },
+          "f1": {
+            "value": 0.0,
+            "predicted_n": 61,
+            "gold_n": 61
+          }
+        }
+      },
+      "fama_macro": {
+        "numerator": 0.0,
+        "denominator": 40,
+        "value": 0.0,
+        "undefined_scored_as_zero_n": 5,
+        "denominator_policy": "all_dialogues"
+      }
+    }
+  },
+  "value_flip_control": {
+    "unit_n": 82,
+    "caught_n": 82,
+    "matched_n": 82,
+    "catch_rate": 1.0,
+    "required_catch_rate": 0.9
+  },
+  "discrimination_check": {
+    "oracle_must_include": 1.0,
+    "negative_must_include": {
+      "gibberish": 0.0,
+      "semantic_inversion": 0.0
+    },
+    "gap": {
+      "gibberish": 1.0,
+      "semantic_inversion": 1.0
+    },
+    "min_gap": 1.0,
+    "value_flip_catch_rate": 1.0,
+    "required_gap": 0.5,
+    "passes": true
   }
 }

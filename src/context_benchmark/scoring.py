@@ -10,9 +10,10 @@ from collections import Counter, defaultdict
 from typing import Any, Iterable
 
 from .ontology import ACTIVE_TYPES, TYPE_TO_CODE
+from .semantic import semantic_conflict
 from .validation import public_constraint, validate_output
 
-MATCHER_VERSION = "evidence_char_ngram_greedy_v2_text_gated"
+MATCHER_VERSION = "evidence_char_ngram_greedy_v3_text_gated_semantic_guard"
 # These gates are UNCALIBRATED engineering heuristics. They were chosen so that
 # a hand-written short paraphrase of a constructed unit survives while pure
 # garbage (unrelated text with perfect evidence) does not. No human annotation
@@ -145,6 +146,7 @@ def score_dialogue(dialogue: dict[str, Any], prediction_row: dict[str, Any]) -> 
     supersession_links_correct = 0
     tp_by_type = Counter()
     content_ok_n = 0
+    semantic_conflict_n = 0
     pred_by_type = Counter(item.get("type") for item in predictions)
     gold_by_type = Counter(item["type"] for item in gold)
 
@@ -154,13 +156,22 @@ def score_dialogue(dialogue: dict[str, Any], prediction_row: dict[str, Any]) -> 
         content_ok = False
         if matched_prediction:
             text_sim = _dice(_ngrams(item["text"]), _ngrams(matched_prediction.get("text", "")))
+            # Semantic guard: a prediction that quotes the gold sentence and
+            # then tells the reader not to follow it ("不要遵守本条", "改为完全
+            # 相反的操作"), or that names the opposite value of the same slot
+            # ("只用邮件" where the user said "只用短信"), is not a correct
+            # constraint no matter how much text it shares.
+            conflict = semantic_conflict(item["text"], matched_prediction.get("text", ""))
             content_ok = (
                 text_sim >= CONTENT_TEXT_MIN
                 and anchor_coverage(
                     matched_prediction.get("text", ""), turn_map,
                     matched_prediction.get("evidence_turns", []),
                 ) >= ANCHOR_COVERAGE_MIN
+                and not conflict["conflicted"]
             )
+            if conflict["conflicted"]:
+                semantic_conflict_n += 1
         content_ok_n += int(content_ok)
         correct_type = bool(matched_prediction and content_ok and matched_prediction.get("type") == item["type"])
         correct_scope = bool(matched_prediction and content_ok and matched_prediction.get("scope") == item["scope"])
@@ -222,6 +233,9 @@ def score_dialogue(dialogue: dict[str, Any], prediction_row: dict[str, Any]) -> 
             "text_min": CONTENT_TEXT_MIN,
             "anchor_coverage_min": ANCHOR_COVERAGE_MIN,
             "content_ok_n": content_ok_n,
+            "semantic_conflict_n": semantic_conflict_n,
+            "semantic_guard": "slot_opposition_and_meta_override_v1",
+            "semantic_guard_calibrated": False,
         },
         "must_include": mpa,
         "must_exclude_absence": faa,
@@ -353,6 +367,7 @@ def score_counterfactual(probe_results: list[dict[str, Any]]) -> dict[str, Any]:
     false_trigger = []
     unclassified_related_n = 0
     unscorable_probes_n = 0
+    semantics_seen: set[str] = set()
     for probe_id, arms in grouped.items():
         if not {"true", "none", "fake"} <= set(arms):
             continue
@@ -374,11 +389,22 @@ def score_counterfactual(probe_results: list[dict[str, Any]]) -> dict[str, Any]:
         fake_deltas.append(means["fake"] - means["none"])
         negative_transfer.append(int(means["true"] < means["none"]))
         related = arms["true"][0].get("related")
+        # What does compliant=1 mean for this probe? Two conventions exist and
+        # they invert the false-trigger direction:
+        #   follows_injection — compliant=1 means the behaviour applied the
+        #       injected rule; a false trigger is then true > none.
+        #   task_correct — compliant=1 means the behaviour was correct for the
+        #       task; applying an irrelevant rule makes it wrong, so a false
+        #       trigger is then true < none.
+        # Mixing the two silently produced a false-trigger rate of exactly 0
+        # in one direction. The convention is read from the probe row.
+        semantics = arms["true"][0].get("compliant_semantics") or "follows_injection"
+        semantics_seen.add(semantics)
         if related is False:
-            # Unrelated probe: following the injected constraint is a false
-            # trigger. The old code checked `true < none`, which was the
-            # opposite direction and could never fire on a correct model.
-            false_trigger.append(int(means["true"] > means["none"]))
+            if semantics == "task_correct":
+                false_trigger.append(int(means["true"] < means["none"]))
+            else:
+                false_trigger.append(int(means["true"] > means["none"]))
         elif related is None:
             unclassified_related_n += 1
     return {
@@ -388,6 +414,7 @@ def score_counterfactual(probe_results: list[dict[str, Any]]) -> dict[str, Any]:
         "negative_transfer_rate": ratio(sum(negative_transfer), len(negative_transfer)),
         "false_trigger_rate": ratio(sum(false_trigger), len(false_trigger)),
         "validity_warning_fake_positive": bool(fake_deltas and sum(fake_deltas) / len(fake_deltas) > 0),
+        "compliant_semantics_seen": sorted(semantics_seen),
         "denominators": {
             "true_delta": len(deltas),
             "fake_delta": len(fake_deltas),

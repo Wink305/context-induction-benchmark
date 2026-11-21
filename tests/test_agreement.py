@@ -1,7 +1,13 @@
 import copy
 import unittest
 
-from context_benchmark.agreement import agreement_report, cohen_kappa, gwet_ac1
+from context_benchmark.agreement import (
+    KAPPA_CI_LOWER_MIN,
+    KAPPA_POINT_MIN,
+    agreement_report,
+    cohen_kappa,
+    gwet_ac1,
+)
 from context_benchmark.io import read_jsonl
 
 
@@ -75,6 +81,129 @@ class AgreementTests(unittest.TestCase):
     def test_gwet_is_reported(self):
         result = gwet_ac1(["S", "S", "O"], ["S", "O", "O"])
         self.assertIn("ac1", result)
+
+
+class KappaOnlyGateTests(unittest.TestCase):
+    """The gate is Cohen's kappa — for every class, rare ones included."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dialogues = read_jsonl("data/pilot_v0/candidate_truth.jsonl")
+
+    def annotations(self):
+        return [
+            {"dialogue_id": row["dialogue_id"], "annotations": copy.deepcopy(row["candidate_truth"])}
+            for row in self.dialogues
+        ]
+
+    @staticmethod
+    def _unit(text, kind):
+        return {
+            "id": f"c{text}",
+            "type": kind,
+            "text": text,
+            "scope": "global",
+            "category": "process",
+            "evidence_turns": [1],
+            "valid_from": 1,
+            "valid_to": None,
+            "superseded_by": None,
+            "rule_tags": [],
+        }
+
+    @classmethod
+    def _dataset(cls, plan):
+        """One dialogue per unit; A and B annotate the same text."""
+        rows_a = []
+        rows_b = []
+        for index, (kind_a, kind_b) in enumerate(plan):
+            text = f"用例{index:03d}"
+            rows_a.append({"dialogue_id": f"d{index:03d}", "annotations": [cls._unit(text, kind_a)]})
+            rows_b.append({"dialogue_id": f"d{index:03d}", "annotations": [cls._unit(text, kind_b)]})
+        return rows_a, rows_b
+
+    @classmethod
+    def _rare_class_dataset(cls):
+        """100 units where the rare class disagrees on half of its instances.
+
+        ``superseded`` is used by each annotator 10 times out of 100 units and
+        they agree on only 5 of them: kappa collapses to ~0.44 while AC1 sits
+        at ~0.88.  The old gate let this class pass on AC1.
+        """
+        plan = []
+        for index in range(100):
+            if index < 5:
+                plan.append(("superseded", "superseded"))
+            elif index < 10:
+                plan.append(("superseded", "standing"))
+            elif index < 15:
+                plan.append(("standing", "superseded"))
+            else:
+                plan.append(("standing", "standing"))
+        return cls._dataset(plan)
+
+    @classmethod
+    def _agreed_rare_class_dataset(cls):
+        """Same rare class, no disagreement: it must still pass the gate."""
+        plan = [
+            ("superseded", "superseded") if index < 5 else ("standing", "standing")
+            for index in range(100)
+        ]
+        return cls._dataset(plan)
+
+    def test_gate_metric_is_kappa_for_every_class(self):
+        rows = self.annotations()
+        result = agreement_report(rows, copy.deepcopy(rows), bootstrap_n=50)
+        for ctype, item in result["per_type"].items():
+            self.assertEqual(item["threshold_metric"], "cohen_kappa", ctype)
+            self.assertEqual(item["threshold_used"], KAPPA_POINT_MIN, ctype)
+            self.assertTrue(item["gwet_ac1_report_only"], ctype)
+
+    def test_rare_class_with_low_kappa_fails_even_when_ac1_is_high(self):
+        rows_a, rows_b = self._rare_class_dataset()
+        result = agreement_report(rows_a, rows_b, bootstrap_n=100)
+        item = result["per_type"]["superseded"]
+        self.assertTrue(item["rare_class"])
+        # AC1 would have let this class through; kappa does not.
+        self.assertGreaterEqual(item["gwet_ac1"], 0.75)
+        self.assertLess(item["kappa"], KAPPA_POINT_MIN)
+        self.assertFalse(item["pass_gate"])
+        self.assertTrue(any("cohen_kappa" in reason for reason in item["gate_failures"]))
+        self.assertFalse(result["exit_checks"]["per_type_pass"])
+        self.assertFalse(result["gold_freeze_allowed"])
+
+    def test_rare_class_that_agrees_still_passes(self):
+        rows_a, rows_b = self._agreed_rare_class_dataset()
+        result = agreement_report(rows_a, rows_b, bootstrap_n=100)
+        item = result["per_type"]["superseded"]
+        self.assertTrue(item["rare_class"])
+        self.assertTrue(item["pass_gate"], item["gate_failures"])
+
+    def test_class_neither_annotator_used_is_not_a_failure(self):
+        rows = self.annotations()
+        result = agreement_report(rows, copy.deepcopy(rows), bootstrap_n=50)
+        absent = result["per_type"]["__absent__"]
+        self.assertTrue(absent["both_annotators_never_used_class"])
+        self.assertTrue(absent["pass_gate"])
+
+    def test_ac1_is_reported_for_information_only(self):
+        rows = self.annotations()
+        result = agreement_report(rows, copy.deepcopy(rows), bootstrap_n=50)
+        self.assertTrue(result["gwet_ac1"]["report_only"])
+        self.assertIn("kappa", result["gwet_ac1"]["note"].lower())
+        self.assertIsNotNone(result["gwet_ac1"]["overall"])
+
+    def test_report_records_annotator_provenance(self):
+        rows = self.annotations()
+        for row in rows:
+            row["annotator"] = "A"
+        human = agreement_report(rows, copy.deepcopy(rows), bootstrap_n=20)
+        self.assertEqual(human["annotator_type"], "human")
+        ai_rows = copy.deepcopy(rows)
+        for row in ai_rows:
+            row["annotator"] = "AI-precheck"
+        ai = agreement_report(ai_rows, copy.deepcopy(ai_rows), bootstrap_n=20)
+        self.assertEqual(ai["annotator_type"], "ai_precheck")
 
 
 if __name__ == "__main__":

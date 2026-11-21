@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "kind": "dataset_extension",
+  "benchmark_version": "0.4.0",
+  "dimension_set_version": "six-axis-v1",
+  "dataset_id": "pilot-v1-randomized",
+  "dataset_version": "pilot-v1-randomized",
+  "split": "public",
+  "source_type": "synthetic_template",
+  "evidence_grade": "generator_truth_rule_audited",
+  "human_annotation_complete": false,
+  "gold_version": null,
+  "seed": 20261120,
+  "generation_method": "deterministic_template_v1_randomized",
+  "generator_config_sha256": "b5147abe1f48ca91e1e92d200c065577890fabd29212484fc3cea4b18a5cf764",
+  "provenance": {
+    "contributor": "",
+    "license": "MIT",
+    "compliance_note": null
+  },
+  "files": {
+    "tasks.jsonl": "6222cc0aaf2be5ed2023eec8d856f8d57f5f966f990f948eb3de71e72816ff7d",
+    "candidate_truth.jsonl": "eb696ff85e55195014544bb81dcfad5bccb32b185337af41eccde3e803bc34d7",
+    "annotation_worksheet.jsonl": "383c0261295c667b040c4af1d5545f7d29602ec57bab1ca0e5f3b9070a2e8c11",
+    "calibration_ids.json": "8f75126ca27d17b0e045b539ae662082f5c7649ba66e63e0aa52ac04d231c57b",
+    "coverage.json": "ee786176b585232ca4ca79ab4635bc02a57f612be4b9a949325280e1ae1a9a00",
+    "manifest.json": "6b94072a5722aebe4889ebdc9723ff780ed0e8b332475c0a2f1b45ad6efea519"
+  },
+  "declared_limitations": [
+    "No human gold and no inter-annotator agreement have been measured for this project yet.",
+    "Self-check scores are scorer sanity checks, not model results.",
+    "Synthetic template dialogues have low lexical diversity; external validity is unverified."
+  ]
+}

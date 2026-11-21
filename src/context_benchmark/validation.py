@@ -147,6 +147,20 @@ def public_constraint(item: dict[str, Any]) -> dict[str, Any]:
     return {key: item[key] for key in BASE_FIELDS}
 
 
+def row_units(row: dict[str, Any]) -> list[dict[str, Any]]:
+    """The units carried by one dialogue's annotation row.
+
+    ``annotations`` is the contract key — the annotation worksheet uses it,
+    and so do the agreement gate and the adjudication gate.  ``constraints``
+    is the legacy alias; both are accepted, so an older or hand-authored
+    artefact still loads instead of silently agreeing on zero units.
+    """
+    units = row.get("annotations")
+    if not isinstance(units, list):
+        units = row.get("constraints")
+    return units if isinstance(units, list) else []
+
+
 def validate_candidate_dialogue(dialogue: dict[str, Any]) -> ValidationReport:
     issues: list[Issue] = []
     turns = dialogue.get("turns", [])

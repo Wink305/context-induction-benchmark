@@ -139,6 +139,52 @@ class RunSubmissionTests(unittest.TestCase):
         self.build(scores_declared=True, dimensions_reported=["A", "C", "D"])
         self.assertTrue(self.validate()["valid"])
 
+    def test_declared_scores_without_verification_are_rejected(self):
+        """A package that claims scores must say how they were obtained."""
+        self.build(scores_declared=True, dimensions_reported=["A"])
+        document = read_json(self.package / "submission.json")
+        document.pop("scores_verification", None)
+        write_json(self.package / "submission.json", document)
+        self.assertIn("missing_scores_verification", _codes(self.validate()))
+
+    def test_unverifiable_scores_must_say_so(self):
+        """No dataset on this machine => the package has to declare it."""
+        self.build(scores_declared=True, dimensions_reported=["A"])
+        document = read_json(self.package / "submission.json")
+        # The temp dataset has no candidate_truth.jsonl, so nothing can be
+        # recomputed and the package must not pretend otherwise.
+        self.assertEqual(document["scores_verification"], "not_reproducible_locally")
+        self.assertEqual(document["scores"], {})
+        # ... and because it declared that honestly, the validator accepts it.
+        self.assertNotIn("scores_not_reproducible_locally", _codes(self.validate()))
+        report = self.validate()
+        self.assertTrue(report["valid"], report["issues"])
+        self.assertFalse(report["scores_verified"])
+
+    def test_silent_scores_are_rejected(self):
+        """A package claiming scores but not declaring how is refused."""
+        self.build(scores_declared=True, dimensions_reported=["A"])
+        document = read_json(self.package / "submission.json")
+        document.pop("scores_verification", None)
+        write_json(self.package / "submission.json", document)
+        self.assertIn("missing_scores_verification", _codes(self.validate()))
+
+    def test_claimed_reproduction_without_scores_is_rejected(self):
+        self.build(scores_declared=True, dimensions_reported=["A"])
+        document = read_json(self.package / "submission.json")
+        document["scores_verification"] = "reproduced_locally"
+        document["scores"] = {}
+        write_json(self.package / "submission.json", document)
+        self.assertIn("scores_without_values", _codes(self.validate()))
+
+    def test_unverifiable_scores_must_mention_the_limitation(self):
+        """Saying 'not reproducible' is not enough; the limitations must say so."""
+        self.build(scores_declared=True, dimensions_reported=["A"])
+        document = read_json(self.package / "submission.json")
+        document["declared_limitations"] = ["No human gold and no inter-annotator agreement."]
+        write_json(self.package / "submission.json", document)
+        self.assertIn("scores_limitation_missing", _codes(self.validate()))
+
     def test_denominator_must_add_up(self):
         document = read_json(self.package / "submission.json")
         document["run"]["denominator_disclosure"]["scored_n"] = 99

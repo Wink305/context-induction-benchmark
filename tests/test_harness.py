@@ -47,12 +47,24 @@ class HarnessTests(unittest.TestCase):
         constraints = [public_constraint(item) for item in self.dialogue["candidate_truth"][:2]]
         fake = make_fake_constraints(constraints)
         for source, control in zip(constraints, fake):
-            self.assertEqual(len(source["text"]), len(control["text"]))
+            # Length-aligned without truncation: the control arm must be
+            # readable Chinese, otherwise the model can identify the arm by the
+            # broken sentence alone.
+            self.assertLessEqual(abs(len(source["text"]) - len(control["text"])), 24)
+            self.assertTrue(control["text"].endswith("。"))
             self.assertNotEqual(source["text"], control["text"])
             # No metadata field may reveal which arm a constraint came from.
             self.assertEqual(set(control), set(source))
             self.assertNotIn("fake_control", control)
             self.assertEqual(control["id"], source["id"])
+
+    def test_fake_constraint_text_is_never_cut_mid_phrase(self):
+        """The old implementation truncated to the target length ('以后所有回复都改成五')."""
+        constraints = [public_constraint(item) for item in self.dialogue["candidate_truth"][:4]]
+        for source, control in zip(constraints, make_fake_constraints(constraints)):
+            self.assertNotIn("改成五", control["text"])
+            self.assertNotIn("以后所有问题", control["text"][:6])
+            self.assertTrue(control["text"].endswith("。"))
 
     def test_injected_prompt_does_not_leak_arm_metadata(self):
         from context_benchmark.harness import public_injected

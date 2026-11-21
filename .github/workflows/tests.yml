@@ -32,8 +32,41 @@ jobs:
           PYTHONPATH: src
         run: |
           python -m context_benchmark generate --config configs/generator.json
-          git diff --exit-code -- data/pilot_v0
+          # Only the six generator-written files are frozen. self_check.json is a
+          # scorer artefact and is gated separately by the freshness step below.
+          git diff --exit-code -- \
+            data/pilot_v0/tasks.jsonl \
+            data/pilot_v0/candidate_truth.jsonl \
+            data/pilot_v0/annotation_worksheet.jsonl \
+            data/pilot_v0/calibration_ids.json \
+            data/pilot_v0/coverage.json \
+            data/pilot_v0/manifest.json
           echo "deterministic: regeneration produced no changes"
+
+      - name: Extension set regeneration must be byte-identical
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m context_benchmark generate --config configs/generator.v1.json
+          git diff --exit-code -- data/contrib/pilot-v1-randomized
+          echo "deterministic: extension set regeneration produced no changes"
+      - name: Extension set must pass the audit and the submission contract
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m context_benchmark audit \
+            --candidate data/contrib/pilot-v1-randomized/candidate_truth.jsonl \
+            --output "$RUNNER_TEMP/audit_v1.json" > /dev/null
+          python - <<'PY'
+          import json, sys
+          report = json.load(open("$RUNNER_TEMP/audit_v1.json", encoding="utf-8"))
+          print(f"clean {report['clean_unit_n']} / {report['unit_n']}")
+          if report["severity_counts"]:
+              sys.exit(f"audit findings present: {report['severity_counts']}")
+          PY
+          python -m context_benchmark validate-submission --dir data/contrib/pilot-v1-randomized
 
       - name: Audit must stay clean
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
@@ -53,6 +86,52 @@ jobs:
         env:
           PYTHONPATH: src
         run: python -m context_benchmark self-check --candidate data/pilot_v0/candidate_truth.jsonl
+
+      - name: Committed self-check artifact must match a fresh run
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m context_benchmark self-check \
+            --candidate data/pilot_v0/candidate_truth.jsonl \
+            --output "$RUNNER_TEMP/self_check.json" > /dev/null
+          python - <<'PY'
+          import json, sys
+          fresh = json.load(open("$RUNNER_TEMP/self_check.json", encoding="utf-8"))
+          committed = json.load(open("data/pilot_v0/self_check.json", encoding="utf-8"))
+          for key in ("scorer_version", "matcher_version", "oracle_aggregate",
+                      "negative_control_aggregates", "discrimination_check"):
+              if key in committed and committed[key] != fresh[key]:
+                  sys.exit(f"committed self_check.json is stale for key {key!r}: "
+                           f"committed={committed[key]!r} fresh={fresh[key]!r}")
+          print("self-check artifact is in sync with the installed scorer")
+          PY
+
+      - name: Documentation numbers must match the repository
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        run: python scripts/check_docs.py
+
+      - name: Human annotation chain runs end to end
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m unittest tests.test_annotation_pipeline -v
+          python -m context_benchmark make-sheets \
+            --worksheet data/pilot_v0/annotation_worksheet.jsonl \
+            --out-dir "$RUNNER_TEMP/sheets_A" --annotator A > /dev/null
+          python - <<'PY'
+          import pathlib, sys
+          sheets = sorted(pathlib.Path("$RUNNER_TEMP/sheets_A").glob("*.md"))
+          if not sheets:
+              sys.exit("no sheets were rendered")
+          for path in sheets:
+              text = path.read_text(encoding="utf-8")
+              answer = text.split("<!-- ANSWER_START -->", 1)[1].split("<!-- ANSWER_END -->", 1)[0]
+              if answer.strip():
+                  sys.exit(f"{path.name} already contains answers")
+          print(f"{len(sheets)} answer-free sheets rendered")
+          PY
 
       - name: Attribution axes E/F run end-to-end
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'

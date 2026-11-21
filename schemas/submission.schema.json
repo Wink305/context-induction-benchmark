@@ -19,6 +19,15 @@
     "dimension_set_version": {"type": "string", "minLength": 1},
     "primary_dimension": {"const": "A"},
     "scores_declared": {"type": "boolean"},
+    "scores_verification": {
+      "type": ["string", "null"],
+      "enum": ["reproduced_locally", "not_reproducible_locally", null]
+    },
+    "scores": {
+      "type": "object",
+      "description": "Declared aggregate scores. When scores_verification is 'reproduced_locally' the validator recomputes these from the packaged predictions and the resolvable dataset and rejects any mismatch.",
+      "additionalProperties": {"type": ["number", "null"]}
+    },
     "dimensions_reported": {"type": "array", "items": {"enum": ["A", "B", "C", "D", "E", "F"]}, "uniqueItems": true},
     "status": {"type": "string", "minLength": 1},
     "dataset": {
@@ -111,7 +120,16 @@
   "allOf": [
     {
       "if": {"properties": {"scores_declared": {"const": true}}},
-      "then": {"properties": {"dimensions_reported": {"minItems": 1, "contains": {"const": "A"}}}}
+      "then": {
+        "properties": {
+          "dimensions_reported": {"minItems": 1, "contains": {"const": "A"}},
+          "scores_verification": {"enum": ["reproduced_locally", "not_reproducible_locally"]}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"scores_verification": {"const": "reproduced_locally"}}},
+      "then": {"required": ["scores"], "properties": {"scores": {"minProperties": 1}}}
     },
     {
       "if": {"properties": {"dataset": {"properties": {"evidence_grade": {"const": "human_gold"}}}}},
