@@ -203,7 +203,9 @@ def classify_annotator(values: Iterable[Any]) -> str:
     return HUMAN_PROVENANCE
 
 
-def collect_generator_findings(payload: Any, *, path: str = "") -> list[dict[str, Any]]:
+def collect_generator_findings(
+    payload: Any, *, path: str = "", containers: bool = True
+) -> list[dict[str, Any]]:
     """Find generator-origin markers in a nested payload.
 
     Separate from :func:`collect_provenance_findings` because the question
@@ -221,13 +223,21 @@ def collect_generator_findings(payload: Any, *, path: str = "") -> list[dict[str
 
     The dialogue-level ``status: "generated_unannotated_not_gold"`` is
     already caught by :func:`collect_provenance_findings`.
+
+    ``containers`` controls whether a ``candidate_truth`` list is treated as
+    the generator's label container.  Turn it off when scanning a **frozen
+    gold file**: that file legitimately carries ``candidate_truth`` because
+    the scorer reads ``dialogue["candidate_truth"]``.  The key name is a file
+    format there, not a provenance claim.
     """
     findings: list[dict[str, Any]] = []
-    _walk_generator(payload, path or "$", findings)
+    _walk_generator(payload, path or "$", findings, containers)
     return findings
 
 
-def _walk_generator(node: Any, path: str, findings: list[dict[str, Any]]) -> None:
+def _walk_generator(
+    node: Any, path: str, findings: list[dict[str, Any]], containers: bool = True
+) -> None:
     if isinstance(node, dict):
         for key, value in node.items():
             child_path = f"{path}.{key}"
@@ -236,7 +246,7 @@ def _walk_generator(node: Any, path: str, findings: list[dict[str, Any]]) -> Non
                     {"path": child_path, "value": value, "reason": "unit is a generator candidate label"}
                 )
                 continue
-            if key == GENERATOR_CONTAINER_KEY and isinstance(value, list):
+            if containers and key == GENERATOR_CONTAINER_KEY and isinstance(value, list):
                 findings.append(
                     {"path": child_path, "value": f"<{len(value)} units>",
                      "reason": "dialogue carries a generator truth container"}
@@ -253,7 +263,7 @@ def _walk_generator(node: Any, path: str, findings: list[dict[str, Any]]) -> Non
                         {"path": child_path, "value": value, "reason": "note says the unit awaits a human decision"}
                     )
                     continue
-            _walk_generator(value, child_path, findings)
+            _walk_generator(value, child_path, findings, containers)
     elif isinstance(node, list):
         for index, item in enumerate(node):
-            _walk_generator(item, f"{path}[{index}]", findings)
+            _walk_generator(item, f"{path}[{index}]", findings, containers)

@@ -24,6 +24,7 @@ from typing import Any
 from . import __version__ as PACKAGE_VERSION
 from .dimensions import DIMENSION_SET_VERSION, PRIMARY_DIMENSION, validate_dimension_set
 from .io import canonical_json, read_json, read_jsonl, sha256_file, sha256_text, write_json
+from .provenance import collect_generator_findings, collect_provenance_findings
 from .validation import validate_output
 
 DEFAULT_BENCHMARK_CONFIG = "configs/benchmark.json"
@@ -574,6 +575,26 @@ def _packaged_gold(files: dict[str, Any]) -> str | None:
     return None
 
 
+def _gold_provenance_findings(gold_path: Path) -> list[dict[str, Any]]:
+    """Provenance findings in a packaged gold file.
+
+    The frozen gold carries ``candidate_truth`` because the scorer reads
+    ``dialogue["candidate_truth"]``, so the container-key rule is switched
+    off here: the key name is a file format in a gold file, not a claim
+    about where the labels came from.  The unit-level and status-level
+    generator markers still apply, as do the AI markers.
+    """
+    findings: list[dict[str, Any]] = []
+    try:
+        rows = read_jsonl(gold_path)
+    except (ValueError, OSError):
+        return findings
+    generator = collect_generator_findings(rows, path="$", containers=False)
+    if generator:
+        return generator
+    return collect_provenance_findings(rows, path="$")
+
+
 def _row_output(row: Any) -> Any:
     """The output payload of a prediction row, mirroring the scorer's fallback."""
     if not isinstance(row, dict):
@@ -768,6 +789,17 @@ def _check_human_gold(
             if isinstance(declared_gold_sha, str) and declared_gold_sha != actual:
                 _issue(issues, "human_gold_hash_mismatch",
                        f"{gold_name}: dataset.gold_sha256 does not match the packaged gold file")
+            # The shipped bytes are checked too, not only the report's word.
+            # A package that renames generator truth to gold.jsonl would
+            # otherwise pass this gate on the strength of its own report.
+            for finding in _gold_provenance_findings(gold_path):
+                _issue(
+                    issues,
+                    "fake_human_gold",
+                    f"{gold_name}: the packaged gold carries non-human provenance "
+                    f"({finding['path']}={finding['value']!r}, {finding['reason']})",
+                )
+                break
 
     report_name = dataset.get("annotation_report_file")
     if isinstance(report_name, str) and report_name:

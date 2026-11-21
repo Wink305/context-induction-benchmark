@@ -143,7 +143,7 @@ The five calibration dialogues each plant a different trap: a standard segment, 
 
 Two properties are enforced rather than promised. The freeze **refuses generator or AI provenance** — the shipped `candidate_truth.jsonl` carries a generator truth container, marks every one of its 420 units `candidate_only: true`, and marks its dialogues `generated_unannotated_not_gold`, so that file can never back a `human_gold` claim even if the unit-level markers are stripped. And **one annotator cannot certify agreement**: freezing requires two distinct annotators, and the third reviewer who adjudicates the conflicts may not be either of them.
 
-The freezer can verify that two distinct *annotator labels* exist; it cannot verify that two distinct *people* did the work. That limit is stated in `P0_标注链与金标冻结.md` §5.1 rather than papered over: the control for it is publishing the annotation records with identifiable annotators, and the frozen manifest records the labels so the claim can be audited.
+The freezer can verify that two distinct *annotator labels* exist; it cannot verify that two distinct *people* did the work. That limit is stated in `P0_标注链与金标冻结.md` §5.2 rather than papered over: the control for it is publishing the annotation records with identifiable annotators, and the frozen manifest records the labels so the claim can be audited.
 
 What has *not* happened yet: no human has filled a sheet, so no κ has been measured and no gold has been frozen. The chain is a working instrument, not a result.
 
@@ -233,6 +233,8 @@ The validator does not take the package's word for anything it can recompute fro
 - **Evidence hashes** of the canonical repository files (scorer, config, prompts) must match the installed tree, so changing the scorer invalidates every submission that claims reproducibility.
 
 It also rejects unsupported versions, unpinned models, fake `human_gold`, missing compliance notes for real data, and score declarations that omit the primary dimension. It exits 1 on failure and runs in CI. Contract: `schemas/submission.schema.json`; implementation: `src/context_benchmark/manifest.py`.
+
+A `human_gold` claim is checked against the **shipped bytes**, not just the annotation report's word: the packaged gold file is scanned for generator and AI provenance markers, so renaming `candidate_truth.jsonl` to `gold.jsonl` and writing a report that claims two human annotators and a plausible κ is rejected. (The frozen gold legitimately carries a `candidate_truth` key because the scorer reads it — that key name is a file format, not a provenance claim, and the container rule is switched off for gold files.)
 
 ### Extending the sample set
 

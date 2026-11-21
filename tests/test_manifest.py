@@ -132,6 +132,76 @@ class RunSubmissionTests(unittest.TestCase):
         write_json(self.package / "submission.json", document)
         self.assertIn("fake_human_gold", _codes(self.validate()))
 
+    def test_generator_truth_shipped_as_gold_is_rejected(self):
+        """A package must not be able to rename generator truth to gold.jsonl.
+
+        The annotation report is written to look perfect — human annotator
+        type, two annotators, a plausible kappa.  The gate that stops this
+        is the one that reads the **shipped bytes**, not the report.
+        """
+        gold = self.package / "gold.jsonl"
+        shutil.copyfile("data/pilot_v0/candidate_truth.jsonl", gold)
+        report = self.package / "annotation_report.json"
+        write_json(report, {
+            "annotator_type": "human",
+            "annotator_n": 2,
+            "unit_n": 420,
+            "overall_kappa": 0.88,
+            "per_class_kappa": {"standing": 0.91, "one_off": 0.84},
+            "kappa_ci_lower": 0.80,
+            "ac1": 0.89,
+            "adjudication_method": "third_reviewer_decision_per_conflict",
+        })
+        document = read_json(self.package / "submission.json")
+        document["files"]["gold.jsonl"] = sha256_file(gold)
+        document["files"]["annotation_report.json"] = sha256_file(report)
+        document["dataset"]["evidence_grade"] = "human_gold"
+        document["dataset"]["human_annotation_complete"] = True
+        document["dataset"]["gold_version"] = "v1.0"
+        document["dataset"]["gold_sha256"] = sha256_file(gold)
+        document["dataset"]["annotation_report_file"] = "annotation_report.json"
+        write_json(self.package / "submission.json", document)
+        codes = _codes(self.validate())
+        self.assertIn("fake_human_gold", codes)
+
+    def test_a_frozen_gold_file_is_not_mistaken_for_generator_output(self):
+        """The frozen gold carries candidate_truth; that is a file format."""
+        gold = self.package / "gold.jsonl"
+        write_jsonl(gold, [{
+            "dialogue_id": "x-001",
+            "status": "human_adjudicated_gold",
+            "gold_provenance": "human",
+            "gold_version": "v1.0",
+            "turns": [{"turn": 1, "speaker": "user", "text": "以后只用邮件"}],
+            "candidate_truth": [{
+                "id": "c001", "type": "standing", "text": "只用邮件",
+                "evidence_turns": [1], "valid_from": 1, "valid_to": None,
+                "scope": "global", "superseded_by": None, "category": "communication",
+            }],
+            "constraints": [{
+                "id": "c001", "type": "standing", "text": "只用邮件",
+                "evidence_turns": [1], "valid_from": 1, "valid_to": None,
+                "scope": "global", "superseded_by": None, "category": "communication",
+            }],
+        }])
+        report = self.package / "annotation_report.json"
+        write_json(report, {
+            "annotator_type": "human", "annotator_n": 2, "unit_n": 1,
+            "overall_kappa": 0.9, "per_class_kappa": {"standing": 0.9},
+            "kappa_ci_lower": 0.8, "ac1": 0.9,
+            "adjudication_method": "third_reviewer_decision_per_conflict",
+        })
+        document = read_json(self.package / "submission.json")
+        document["files"]["gold.jsonl"] = sha256_file(gold)
+        document["files"]["annotation_report.json"] = sha256_file(report)
+        document["dataset"]["evidence_grade"] = "human_gold"
+        document["dataset"]["human_annotation_complete"] = True
+        document["dataset"]["gold_version"] = "v1.0"
+        document["dataset"]["gold_sha256"] = sha256_file(gold)
+        document["dataset"]["annotation_report_file"] = "annotation_report.json"
+        write_json(self.package / "submission.json", document)
+        self.assertNotIn("fake_human_gold", _codes(self.validate()))
+
     def test_scores_declared_requires_primary_dimension(self):
         self.mutate(scores_declared=True, dimensions_reported=["B"])
         codes = _codes(self.validate())
