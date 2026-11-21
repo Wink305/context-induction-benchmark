@@ -172,6 +172,33 @@ class KappaOnlyGateTests(unittest.TestCase):
         self.assertFalse(result["exit_checks"]["per_type_pass"])
         self.assertFalse(result["gold_freeze_allowed"])
 
+    def test_ac1_can_be_near_perfect_while_kappa_is_negative(self):
+        """The sharper failure mode: AC1 says "excellent", kappa says "worse than chance".
+
+        Four rare-class units go to different annotators while ninety-six
+        are untouched by either.  The rare class is used ten times each
+        way, so AC1's chance-corrected agreement lands near 0.96 — a number
+        any reader would call outstanding — while Cohen's kappa, which
+        charges for the chance overlap, goes negative.  A gate that falls
+        back to AC1 would wave this through.
+        """
+        plan = []
+        for index in range(100):
+            if index in (3, 11):
+                plan.append(("superseded", "standing"))
+            elif index in (7, 19):
+                plan.append(("standing", "superseded"))
+            else:
+                plan.append(("standing", "standing"))
+        rows_a, rows_b = self._dataset(plan)
+        result = agreement_report(rows_a, rows_b, bootstrap_n=200)
+        item = result["per_type"]["superseded"]
+        self.assertGreater(item["gwet_ac1"], 0.9)
+        self.assertLess(item["kappa"], 0.0)
+        self.assertFalse(item["pass_gate"])
+        self.assertFalse(result["exit_checks"]["per_type_pass"])
+        self.assertFalse(result["gold_freeze_allowed"])
+
     def test_rare_class_that_agrees_still_passes(self):
         rows_a, rows_b = self._agreed_rare_class_dataset()
         result = agreement_report(rows_a, rows_b, bootstrap_n=100)
