@@ -30,7 +30,16 @@ Three detection mechanisms:
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any, Iterable
+
+from .io import read_jsonl
+from .validation import (
+    annotation_content_hash,
+    dialogue_content_hashes,
+    row_units,
+    truth_rows_as_annotations,
+)
 
 HUMAN_PROVENANCE = "human"
 UNKNOWN_PROVENANCE = "unknown"
@@ -102,6 +111,21 @@ GENERATOR_CONTAINER_KEY = "candidate_truth"
 # Free-text markers that only appear in generator-authored notes.  Matched as
 # substrings because they are specific to this workflow.
 GENERATOR_TEXT_MARKERS_CN = ("待人工确认", "候选")
+
+# Where the deterministic generator's truth lives in this repository.  These
+# files are the reference point for the content-level laundering check: a
+# human gold claim whose labels are the generator's own labels, word for
+# word, is not a human annotation.
+GENERATOR_TRUTH_GLOBS = (
+    "data/pilot_v0/candidate_truth.jsonl",
+    "data/contrib/*/candidate_truth.jsonl",
+)
+
+# More than this share of the non-empty dialogues reproducing the generator's
+# labels exactly is not credible as an independent annotation.  The threshold
+# is deliberately conservative: it only fires on a wholesale copy, which is
+# what laundering looks like.
+GENERATOR_TRUTH_OVERLAP_MAX = 0.5
 
 # Fields that may carry the origin of a record or of one of its units.
 PROVENANCE_FIELDS = (
@@ -239,6 +263,13 @@ def _walk_generator(
     node: Any, path: str, findings: list[dict[str, Any]], containers: bool = True
 ) -> None:
     if isinstance(node, dict):
+        # A frozen gold file legitimately carries ``candidate_truth`` because
+        # the scorer reads ``dialogue["candidate_truth"]`` — that key is a file
+        # format there, not a provenance claim.  Such a row says so itself:
+        # ``gold_provenance: "human"``.  The unit-level markers and the
+        # generator status still apply to it, so declaring a human origin
+        # does not launder anything.
+        human_declared = normalize_value(node.get("gold_provenance")) == HUMAN_PROVENANCE
         for key, value in node.items():
             child_path = f"{path}.{key}"
             if key in GENERATOR_UNIT_FIELDS and value is True:
@@ -246,7 +277,7 @@ def _walk_generator(
                     {"path": child_path, "value": value, "reason": "unit is a generator candidate label"}
                 )
                 continue
-            if containers and key == GENERATOR_CONTAINER_KEY and isinstance(value, list):
+            if containers and not human_declared and key == GENERATOR_CONTAINER_KEY and isinstance(value, list):
                 findings.append(
                     {"path": child_path, "value": f"<{len(value)} units>",
                      "reason": "dialogue carries a generator truth container"}
@@ -267,3 +298,138 @@ def _walk_generator(
     elif isinstance(node, list):
         for index, item in enumerate(node):
             _walk_generator(item, f"{path}[{index}]", findings, containers)
+
+
+# ---------------------------------------------------------------------------
+# Content-level laundering check
+# ---------------------------------------------------------------------------
+
+
+def shipped_generator_truth_files(repo_root: str | Path | None = None) -> list[Path]:
+    """Every generator truth file shipped in this repository."""
+    root = Path(repo_root) if repo_root else Path(__file__).resolve().parents[2]
+    found: list[Path] = []
+    for pattern in GENERATOR_TRUTH_GLOBS:
+        found.extend(sorted(root.glob(pattern)))
+    return [path for path in found if path.is_file()]
+
+
+def _reference_rows(path: Path) -> list[dict[str, Any]]:
+    try:
+        rows = read_jsonl(path)
+    except (ValueError, OSError):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def generator_truth_laundering(
+    rows: list[dict[str, Any]],
+    *,
+    repo_root: str | Path | None = None,
+    extra_paths: Iterable[str | Path] = (),
+) -> dict[str, Any]:
+    """Does ``rows`` reproduce the shipped generator truth, label for label?
+
+    Marker-based checks can be defeated by deleting the markers, so this
+    compares the **content** of the labels instead: the type, scope,
+    category, wording, evidence, validity window, supersession link and
+    boundary tags of every unit — everything except the bookkeeping fields
+    (``id``, ``note``, ``candidate_only``, ``status``, ``provenance``).
+
+    Two things are reported:
+
+    ``whole_set_match``
+        the annotation set is byte-identical to a shipped generator truth
+        file.  That is the laundering attack, outright.
+    ``overlap_ratio``
+        the share of the reference's **non-empty** dialogues that the
+        annotation set reproduces exactly.  Dialogues the reference leaves
+        empty are excluded: an empty dialogue matches every empty
+        annotation set, so counting them would inflate the number without
+        saying anything.
+
+    ``laundered`` is true when the whole set matches, or when the overlap
+    ratio reaches :data:`GENERATOR_TRUTH_OVERLAP_MAX`.
+    """
+    references: list[tuple[str, list[dict[str, Any]]]] = []
+    paths = [*shipped_generator_truth_files(repo_root), *[Path(p) for p in extra_paths]]
+    for path in paths:
+        if not path.is_file():
+            continue
+        reference_rows = _reference_rows(path)
+        if not reference_rows:
+            continue
+        try:
+            name = str(path.relative_to(Path(repo_root) if repo_root else Path(__file__).resolve().parents[2]))
+        except ValueError:
+            name = str(path)
+        references.append((name, reference_rows))
+    if not references:
+        return {
+            "reference_n": 0,
+            "files": [],
+            "whole_set_match_path": None,
+            "max_overlap_ratio": None,
+            "max_overlap_path": None,
+            "max_overlap_dialogue_n": 0,
+            "max_overlap_reference_dialogue_n": 0,
+            "laundered": False,
+            "note": "No generator truth file was reachable, so the content-level check could not run.",
+        }
+
+    set_hash = annotation_content_hash(rows)
+    row_fingerprints = dialogue_content_hashes(rows)
+    files: list[dict[str, Any]] = []
+    whole_set_match_path: str | None = None
+    max_ratio = 0.0
+    max_path: str | None = None
+    max_match_n = 0
+    max_reference_n = 0
+    for name, reference_rows in references:
+        reference_annotations = truth_rows_as_annotations(reference_rows)
+        reference_fingerprints = dialogue_content_hashes(reference_annotations)
+        # Dialogues the reference leaves empty carry no information, so they
+        # are excluded from the denominator.
+        non_empty = {
+            dialogue_id: fingerprint
+            for dialogue_id, fingerprint in reference_fingerprints.items()
+            if any(row_units(row) for row in reference_annotations if row.get("dialogue_id") == dialogue_id)
+        }
+        exact_n = sum(
+            1
+            for dialogue_id, fingerprint in non_empty.items()
+            if row_fingerprints.get(dialogue_id) == fingerprint
+        )
+        reference_n = len(non_empty)
+        ratio = (exact_n / reference_n) if reference_n else 0.0
+        whole_set_match = annotation_content_hash(reference_annotations) == set_hash
+        if whole_set_match and whole_set_match_path is None:
+            whole_set_match_path = name
+        if ratio > max_ratio or (ratio == max_ratio and exact_n > max_match_n):
+            max_ratio = ratio
+            max_path = name
+            max_match_n = exact_n
+            max_reference_n = reference_n
+        files.append({
+            "path": name,
+            "whole_set_match": whole_set_match,
+            "reference_dialogue_n": reference_n,
+            "exact_dialogue_n": exact_n,
+            "overlap_ratio": ratio,
+        })
+    laundered = whole_set_match_path is not None or max_ratio >= GENERATOR_TRUTH_OVERLAP_MAX
+    return {
+        "reference_n": len(references),
+        "files": files,
+        "whole_set_match_path": whole_set_match_path,
+        "max_overlap_ratio": max_ratio,
+        "max_overlap_path": max_path,
+        "max_overlap_dialogue_n": max_match_n,
+        "max_overlap_reference_dialogue_n": max_reference_n,
+        "overlap_threshold": GENERATOR_TRUTH_OVERLAP_MAX,
+        "laundered": laundered,
+        "note": (
+            "Compared against the shipped generator truth by label content, not by marker. "
+            "Dialogues the reference leaves empty are excluded from the denominator."
+        ),
+    }
