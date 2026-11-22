@@ -1,9 +1,58 @@
 import unittest
+from pathlib import Path
 
 from context_benchmark.dimensions import (
-    DIMENSION_SET_VERSION, PRIMARY_DIMENSION, attribution_ids, dimension_ids,
-    rankable_ids, registry, validate_dimension_set,
+    DIMENSION_SET_VERSION, IMPLEMENTED_METRICS, PRIMARY_DIMENSION, attribution_ids,
+    dimension_ids, implemented_metric_names, rankable_ids, registry,
+    validate_dimension_set,
 )
+
+
+class MetricImplementationTests(unittest.TestCase):
+    """A registered metric must have an implementation behind it.
+
+    The registry used to list ``hit_rate``, ``FAR``, ``live_constraint_accuracy``,
+    ``hierarchy_S_U_T``, ``task_completion`` and ``quality_decay`` as if they
+    were measured. No scorer ever produced them, so a reader of the registry
+    would believe six metrics exist that do not.
+    """
+
+    def test_registered_metrics_all_exist_in_a_scorer(self):
+        implemented = implemented_metric_names()
+        for item in registry()["dimensions"]:
+            for metric in item["metrics"]:
+                self.assertIn(metric, implemented, f"dimension {item['id']} registers {metric}")
+
+    def test_every_implemented_metric_name_appears_in_its_module(self):
+        root = Path(__file__).resolve().parents[1]
+        for relative_path, names in IMPLEMENTED_METRICS.items():
+            source = (root / relative_path).read_text(encoding="utf-8")
+            for name in names:
+                for part in name.split("."):
+                    self.assertIn(part, source, f"{relative_path} does not define {name}")
+
+    def test_promised_metrics_are_not_claimed_as_implemented(self):
+        implemented = implemented_metric_names()
+        for item in registry()["dimensions"]:
+            for metric in item.get("promised_metrics", []):
+                self.assertNotIn(metric, implemented, f"dimension {item['id']} promises {metric}")
+
+    def test_metrics_state_agrees_with_promised_metrics(self):
+        for item in registry()["dimensions"]:
+            promised = item.get("promised_metrics", [])
+            expected = "partial" if promised else "implemented"
+            self.assertEqual(item["metrics_state"], expected, item["id"])
+
+    def test_the_known_dangling_names_are_promised_not_implemented(self):
+        registry_by_id = {item["id"]: item for item in registry()["dimensions"]}
+        self.assertEqual(registry_by_id["B"]["promised_metrics"], ["hit_rate", "FAR"])
+        self.assertEqual(
+            registry_by_id["C"]["promised_metrics"],
+            ["live_constraint_accuracy", "hierarchy_S_U_T"],
+        )
+        self.assertEqual(registry_by_id["F"]["promised_metrics"], ["quality_decay"])
+        for axis_id in ("A", "D", "E"):
+            self.assertEqual(registry_by_id[axis_id]["promised_metrics"], [], axis_id)
 
 
 class DimensionRegistryTests(unittest.TestCase):

@@ -13,11 +13,16 @@ from context_benchmark.sheets import (
     parse_sheets,
     render_sheet,
 )
-from context_benchmark.io import read_jsonl, write_jsonl
+from context_benchmark.io import read_json, read_jsonl, write_jsonl
 
 
 def wrap(body: str) -> str:
     return f"# sheet\n\n{ANSWER_START}\n{body}\n{ANSWER_END}\n"
+
+
+def hint_block(text: str) -> str:
+    """The per-segment hint section of a rendered sheet."""
+    return text.split("## 二、本段提示", 1)[1].split("## 三、答案区", 1)[0]
 
 
 class SheetRenderTest(unittest.TestCase):
@@ -43,19 +48,55 @@ class SheetRenderTest(unittest.TestCase):
 
     def test_example_does_not_leak_pilot_gold(self):
         """The format example must be fictional, never a real gold unit."""
-        dialogue = read_jsonl("data/pilot_v0/candidate_truth.jsonl")[0]
-        text = render_sheet(dialogue, index=1, total=5, calibration=True, annotator="A")
-        gold_fields = [
-            ("evidence_turns", "3"), ("evidence_turns", "13"),
-            ("text", "仅用邮件联系"), ("text", "回复只要两行重点"),
-            ("text", "电话提醒工单"),
-        ]
+        text = render_sheet(
+            read_jsonl("data/pilot_v0/candidate_truth.jsonl")[0],
+            index=1, total=5, calibration=True, annotator="A",
+        )
         # The fictional framing appears before the example block; gold values
         # must not appear either in the framing or in the example rows.
         leaked_region = text.split("示例：", 1)[0].split("## 三、答案区", 1)[-1] + text.split("示例：", 1)[-1].split("在下面两行注释", 1)[0]
-        for _, value in gold_fields:
-            self.assertNotIn(value, leaked_region, f"gold value {value!r} leaked into the sheet example")
+        # A leak is a *gold unit* reproduced in the example.  Its text is what
+        # identifies it: a bare turn number carries no information, because
+        # the example is a fictional dialogue and says nothing about which
+        # segment of the real task holds a constraint.  Checking every gold
+        # text is strictly stronger than the two hard-coded strings this
+        # test used to look for.
+        gold_texts = {
+            unit["text"]
+            for row in read_jsonl("data/pilot_v0/candidate_truth.jsonl")
+            for unit in row.get("candidate_truth", [])
+            if unit.get("text")
+        }
+        self.assertGreaterEqual(len(gold_texts), 20, "the pilot gold corpus is unexpectedly small")
+        for value in gold_texts:
+            self.assertNotIn(value, leaked_region, f"gold text {value!r} leaked into the sheet example")
         self.assertIn("虚构对话", leaked_region)
+
+    def test_example_is_not_a_pilot_shape(self):
+        """The demo must not teach the pilot's own answers.
+
+        The old example reproduced p0-001's c001 in type/scope/category/tag
+        and taught the "three mentions -> I + R2" rule that hits 16 real
+        units.  Both would inflate kappa by teaching the answers.
+        """
+        text = render_sheet(
+            read_jsonl("data/pilot_v0/candidate_truth.jsonl")[0],
+            index=1, total=5, calibration=True, annotator="A",
+        )
+        demo = text.split("## 三、答案区", 1)[-1].split("在下面两行注释", 1)[0]
+        example_rows = demo.split("示例：", 1)[-1].split("```")[1]
+        # An unrelated domain: none of these words occurs in the pilot's
+        # unit texts or turns (checked against the shipped data).
+        for word in ("打印", "报销", "凭证", "会议室", "碳粉", "内部系统"):
+            self.assertIn(word, demo)
+        for word in ("旅行", "退款", "住宿", "餐饮", "预约电话", "工单升级"):
+            self.assertNotIn(word, demo)
+        # The field guide may explain R2, but the demo rows must not
+        # demonstrate the count-to-three judgment that hits 16 pilot units.
+        self.assertNotIn("R2", example_rows)
+        self.assertIn("R5", example_rows)  # a different I justification
+        for code in ("S", "O", "I", "T"):
+            self.assertIn(f"| {code} |", example_rows)
 
     def test_worksheet_without_truth_never_produces_structural_hints(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -72,8 +113,14 @@ class SheetRenderTest(unittest.TestCase):
             manifest = make_sheets(worksheet, out, calibration_ids=["p0-777"])
             text = (out / "p0-777.md").read_text(encoding="utf-8")
             self.assertFalse(manifest["hints_from_truth"])
-            self.assertNotIn("正确答案是留空", text)
-            self.assertNotIn("显式撤回", text)
+            # Every structural hint the truth path can add starts with
+            # 「本段有」/「本段含」.  Testing that prefix catches all eight of
+            # them at once — not just the one the old test looked for — and it
+            # does not trip on the field documentation, which is identical
+            # for every segment and therefore leaks nothing.
+            for banned in ("本段有", "本段含", "正确答案是留空", "大概率一条约束都没有"):
+                self.assertNotIn(banned, text)
+            self.assertNotIn("显式撤回", hint_block(text))
 
     def test_truth_opt_in_adds_hints_without_revealing_empty_answer(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -112,6 +159,93 @@ class SheetRenderTest(unittest.TestCase):
         }
         text = render_sheet(dialogue, index=1, total=1, calibration=False, annotator="A")
         self.assertIn("A ｜ B", text)
+
+
+class AnswerFreeRenderTest(unittest.TestCase):
+    """The default render must not leak which segments carry constraints."""
+
+    EMPTY_DIALOGUE = {
+        "dialogue_id": "p0-empty",
+        "turns": [{"turn": 1, "speaker": "user", "text": "我住在杭州。"}],
+    }
+    FILLED_DIALOGUE = {
+        "dialogue_id": "p0-filled",
+        "turns": [{"turn": 1, "speaker": "user", "text": "以后都只用邮件联系我，不要打电话。"}],
+    }
+
+    def test_default_render_is_uniform_across_segments(self):
+        empty = render_sheet(self.EMPTY_DIALOGUE, index=1, total=2, calibration=True, annotator="A")
+        filled = render_sheet(self.FILLED_DIALOGUE, index=2, total=2, calibration=True, annotator="A")
+        self.assertEqual(hint_block(empty), hint_block(filled))
+
+    def test_default_render_never_mentions_emptiness(self):
+        for dialogue in (self.EMPTY_DIALOGUE, self.FILLED_DIALOGUE):
+            text = render_sheet(dialogue, index=1, total=2, calibration=True, annotator="A")
+            for banned in ("没有用户约束", "正确答案是留空", "大概率一条约束都没有", "答案区留空"):
+                self.assertNotIn(banned, text)
+
+    def test_worksheet_rows_carrying_a_truth_do_not_leak_it(self):
+        """A worksheet row that still holds labels must not become a hint."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worksheet = root / "worksheet.jsonl"
+            record = dict(self.FILLED_DIALOGUE)
+            record["status"] = "awaiting_independent_annotation"
+            record["annotations"] = []
+            record["candidate_truth"] = [{"id": "c001", "type": "standing", "text": "旧规则", "rule_tags": ["R3"]}]
+            write_jsonl(worksheet, [record])
+            out = root / "sheets"
+            make_sheets(worksheet, out, calibration_ids=["p0-filled"])
+            text = (out / "p0-filled.md").read_text(encoding="utf-8")
+            for banned in ("本段有", "本段含", "正确答案是留空"):
+                self.assertNotIn(banned, text)
+            self.assertNotIn("显式撤回", hint_block(text))
+            self.assertEqual(hint_block(text), hint_block(
+                render_sheet(self.FILLED_DIALOGUE, index=1, total=1, calibration=True, annotator="A")
+            ))
+
+    @unittest.skipUnless(
+        Path("data/annotation/calibration_A").is_dir(),
+        "calibration sheets are local working artifacts and are not published",
+    )
+    def test_committed_calibration_sheets_stay_answer_free(self):
+        truth = {row["dialogue_id"]: row for row in read_jsonl("data/pilot_v0/candidate_truth.jsonl")}
+        blocks = set()
+        paths = sorted(Path("data/annotation/calibration_A").glob("*.md"))
+        self.assertTrue(paths, "calibration sheets are missing")
+        for path in paths:
+            text = path.read_text(encoding="utf-8")
+            answer = text.split(ANSWER_START, 1)[1].split(ANSWER_END, 1)[0]
+            self.assertEqual(answer.strip(), "", f"{path.name} already contains answers")
+            tail = text.split("## 二、本段提示", 1)[1]
+            for unit in truth.get(path.stem, {}).get("candidate_truth", []):
+                value = unit.get("text")
+                if value:
+                    self.assertNotIn(value, tail, f"{path.name} leaks gold text {value!r}")
+            for banned in ("没有用户约束", "正确答案是留空", "大概率一条约束都没有"):
+                self.assertNotIn(banned, text, f"{path.name} hints at the answer")
+            blocks.add(hint_block(text))
+        self.assertEqual(len(blocks), 1, "every calibration sheet must carry the same neutral hint")
+
+    @unittest.skipUnless(
+        Path("data/annotation/precheck_ai_annotations.jsonl").is_file()
+        and Path("data/annotation/precheck_ai_report.json").is_file(),
+        "the AI pre-check artefacts are local working artifacts and are not published",
+    )
+    def test_precheck_ai_sheets_are_not_human_annotation_material(self):
+        """The AI pre-check sheets must never be shipped as annotator sheets."""
+        report = read_json("data/annotation/precheck_ai_report.json")
+        self.assertEqual(report["annotator_type"], "ai_precheck")
+        self.assertEqual(report["evidence_grade"], "ai_precheck_only")
+        self.assertFalse(report["human_annotation_complete"])
+        rows = read_jsonl("data/annotation/precheck_ai_annotations.jsonl")
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(row["provenance"], "ai_precheck")
+            self.assertFalse(row["human_annotation_complete"])
+            for unit in row.get("constraints", []):
+                self.assertNotEqual(unit.get("note"), "human annotation")
+                self.assertIn("AI", unit.get("note", ""))
 
 
 class ParseAnswerTest(unittest.TestCase):
@@ -161,7 +295,7 @@ class ParseAnswerTest(unittest.TestCase):
         )
         records, problems = parse_answer_block(wrap(body))
         self.assertEqual(problems, [])
-        records = finalize_records(records, "p0-001")
+        records = finalize_records(records)
         self.assertEqual(records[0]["valid_to"], 28)
         self.assertEqual(records[0]["superseded_by"], records[1]["id"])
 
@@ -230,9 +364,80 @@ class RoundTripTest(unittest.TestCase):
             self.assertEqual(parsed["sheet_n"], 1)
             self.assertEqual(parsed["annotated_n"], 1)
             self.assertEqual(parsed["problems"], [])
-            record = parsed["annotations"][0]["constraints"][0]
+            # The parsed row carries the units under ``annotations`` — the key
+            # the worksheet, the agreement gate and the adjudication gate all
+            # read.  It used to be emitted as ``constraints`` only, so the
+            # whole chain agreed on zero units.
+            row = parsed["annotations"][0]
+            self.assertIn("annotations", row)
+            record = row["annotations"][0]
             self.assertEqual(record["type"], "standing")
-            self.assertTrue(record["id"].startswith("p0-001-a"))
+            # The id must satisfy the model-output contract (c<number>), so
+            # the annotation can be frozen and scored like a prediction.
+            self.assertRegex(record["id"], r"^c\d+$")
+
+
+class SheetProvenanceTest(unittest.TestCase):
+    """Reading a sheet is not evidence that a human wrote the answers."""
+
+    @staticmethod
+    def _sheet_dir(root: Path, *, manifest_provenance: str | None = None) -> Path:
+        out = root / "sheets"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "p0-900.md").write_text(
+            wrap("1 | S | global | C | 仅用邮件 |"), encoding="utf-8"
+        )
+        if manifest_provenance is not None:
+            (out / "_manifest.json").write_text(
+                '{"provenance": "' + manifest_provenance + '"}', encoding="utf-8"
+            )
+        return out
+
+    def test_no_declaration_resolves_to_unknown_not_human(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parsed = parse_sheets(self._sheet_dir(Path(tmp)), annotator="A")
+            self.assertEqual(parsed["provenance"], "unknown")
+            row = parsed["annotations"][0]
+            self.assertEqual(row["provenance"], "unknown")
+            self.assertNotEqual(row["annotations"][0]["note"], "human annotation")
+
+    def test_explicit_declaration_is_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parsed = parse_sheets(
+                self._sheet_dir(Path(tmp)), annotator="A", provenance="human"
+            )
+            self.assertEqual(parsed["provenance"], "human")
+            self.assertEqual(parsed["annotations"][0]["provenance"], "human")
+            self.assertEqual(
+                parsed["annotations"][0]["annotations"][0]["note"], "human annotation"
+            )
+
+    def test_manifest_declaration_is_inherited(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parsed = parse_sheets(
+                self._sheet_dir(Path(tmp), manifest_provenance="ai_precheck"),
+                annotator="A",
+            )
+            self.assertEqual(parsed["provenance"], "ai_precheck")
+            self.assertEqual(parsed["annotations"][0]["provenance"], "ai_precheck")
+            self.assertNotIn("human", parsed["annotations"][0]["annotations"][0]["note"])
+
+    def test_rendering_manifest_claims_no_human_origin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worksheet = root / "worksheet.jsonl"
+            write_jsonl(worksheet, [{
+                "dialogue_id": "p0-901",
+                "status": "awaiting_independent_annotation",
+                "turns": [{"turn": 1, "speaker": "user", "text": "以后只用邮件"}],
+                "annotations": [],
+            }])
+            out = root / "sheets"
+            manifest = make_sheets(worksheet, out, annotator="A")
+            self.assertEqual(manifest["provenance"], "unannotated_sheets")
+            self.assertEqual(read_json(out / "_manifest.json")["provenance"], "unannotated_sheets")
+            # A freshly rendered, still-empty directory parses as unknown.
+            self.assertEqual(parse_sheets(out, annotator="A")["provenance"], "unknown")
 
 
 if __name__ == "__main__":

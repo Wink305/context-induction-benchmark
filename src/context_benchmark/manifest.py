@@ -15,6 +15,8 @@ hash listed in a package is re-checked on validation.
 
 from __future__ import annotations
 
+import json
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -22,8 +24,46 @@ from typing import Any
 from . import __version__ as PACKAGE_VERSION
 from .dimensions import DIMENSION_SET_VERSION, PRIMARY_DIMENSION, validate_dimension_set
 from .io import canonical_json, read_json, read_jsonl, sha256_file, sha256_text, write_json
+from .provenance import (
+    collect_generator_findings,
+    collect_provenance_findings,
+    generator_truth_laundering,
+)
+from .validation import truth_rows_as_annotations, validate_output
 
 DEFAULT_BENCHMARK_CONFIG = "configs/benchmark.json"
+
+# Bumped whenever the *rules* of validate_submission change, so a report can be
+# traced to the exact contract revision that produced it.
+VALIDATOR_VERSION = "submission-validator-v1"
+# Recomputed scores are compared with this absolute tolerance.
+SCORE_TOLERANCE = 1e-6
+# Aggregate metrics the validator is able to recompute from a resolvable
+# dataset. A declared score outside this set cannot be verified at all.
+RECOMPUTABLE_METRICS = (
+    "must_include",
+    "must_exclude_absence",
+    "fama_macro",
+    "empty_output_accuracy",
+    "fmr",
+    "overgeneralization",
+    "unmatched_prediction_rate",
+    "invalid_output_rate",
+)
+# The values a package may put in its scores map.
+SCORES_VERIFICATION_VALUES = ("reproduced_locally", "not_reproducible_locally")
+# A human_gold claim must ship the gold labels themselves.
+GOLD_ARTIFACT_PATTERN = re.compile(r"(^|/)gold[^/]*\.jsonl$", re.IGNORECASE)
+# ... and a machine-readable annotation report proving how they were produced.
+# Any *report*.json counts, so a package can ship both a human report and an
+# AI precheck report; the human one wins and the AI one is never counted.
+ANNOTATION_REPORT_PATTERN = re.compile(r"(^|/)[^/]*report[^/]*\.json$", re.IGNORECASE)
+# Annotation sources that may never back a human_gold claim.
+AI_ANNOTATOR_TYPES = frozenset({
+    "ai", "ai_precheck", "ai-precheck", "ai_precheck_only", "ai_generated",
+    "ai-generated", "model", "model_generated", "model-generated", "llm",
+    "machine", "auto", "automatic", "自动", "模型", "模型生成", "机器",
+})
 
 
 def _resolve_config_path(path: str | Path) -> Path:
@@ -184,10 +224,39 @@ def build_run_manifest(
     limitations = list(_BASE_LIMITATIONS)
     if dataset_manifest.get("human_annotation_complete") is not True:
         limitations.append("Labels are generator truth checked by a rule audit, not human gold.")
-    if scores_declared:
-        limitations.append("Scores declared by the contributor are not independently reproduced here.")
     if notes:
         limitations.append(notes)
+
+    # Declared scores are never taken on trust. When the dataset is reachable
+    # here, the package ships the numbers this run's own predictions produce
+    # and the validator recomputes them independently from the packaged bytes;
+    # when it is not reachable, the package must say so out loud instead of
+    # implying a verification that never happened.
+    scores_map: dict[str, Any] = {}
+    scores_verification: str | None = None
+    if scores_declared:
+        truth_path = _truth_file(dataset_root)
+        dialogues = _load_dialogues(truth_path)
+        if dialogues:
+            try:
+                from .scoring import score_dataset
+                aggregate = score_dataset(dialogues, predictions).get("aggregate", {})
+            except (KeyError, TypeError, ValueError):
+                aggregate = {}
+            scores_map = {
+                name: (aggregate.get(name) or {}).get("value")
+                for name in RECOMPUTABLE_METRICS
+                if isinstance(aggregate.get(name), dict)
+            }
+        if scores_map:
+            scores_verification = "reproduced_locally"
+        else:
+            scores_verification = "not_reproducible_locally"
+            limitations.append(
+                "The declared scores are not reproducible locally: the dataset behind this run "
+                "is not reachable from this machine, so the numbers could not be recomputed "
+                "and must not be presented as verified."
+            )
 
     evidence = {
         "configs/benchmark.json": _sha_or_none(_repo_file(benchmark_config_path, "configs/benchmark.json")),
@@ -208,6 +277,8 @@ def build_run_manifest(
         "dimension_set_version": config["dimension_set_version"],
         "primary_dimension": PRIMARY_DIMENSION,
         "scores_declared": bool(scores_declared),
+        "scores_verification": scores_verification,
+        "scores": scores_map,
         "dimensions_reported": reported,
         "status": "engineering_run_not_a_benchmark_result",
         "dataset": {
@@ -344,6 +415,25 @@ def _check_schema_shape(document: dict[str, Any], kind: str, issues: list[dict[s
         _issue(issues, "invalid_declared_limitations", "declared_limitations must be a list")
     if not isinstance(document.get("scores_declared"), bool):
         _issue(issues, "invalid_scores_declared", "scores_declared must be a boolean")
+    verification = document.get("scores_verification")
+    if verification is not None and verification not in SCORES_VERIFICATION_VALUES:
+        _issue(issues, "invalid_scores_verification",
+               f"scores_verification must be one of {list(SCORES_VERIFICATION_VALUES)}, got {verification!r}")
+    if document.get("scores_declared"):
+        if verification is None:
+            _issue(issues, "missing_scores_verification",
+                   "a package that declares scores must state scores_verification")
+        if verification == "reproduced_locally" and not document.get("scores"):
+            _issue(issues, "scores_without_values",
+                   "scores_verification='reproduced_locally' requires a non-empty scores map")
+    scores = document.get("scores")
+    if scores is not None:
+        if not isinstance(scores, dict):
+            _issue(issues, "invalid_scores", "scores must be an object")
+        else:
+            for name, value in scores.items():
+                if value is not None and (not isinstance(value, (int, float)) or isinstance(value, bool)):
+                    _issue(issues, "invalid_score_value", f"scores.{name} must be a number or null")
     prov = document.get("provenance")
     if not isinstance(prov, dict):
         _issue(issues, "invalid_provenance", "provenance must be an object")
@@ -399,6 +489,465 @@ def _check_hashes(root: Path, files: Any, issues: list[dict[str, str]]) -> int:
     return checked
 
 
+# ---------------------------------------------------------------------------
+# Recomputation helpers: the validator must not take a package's word for
+# anything it can recompute from the bytes it ships.
+# ---------------------------------------------------------------------------
+
+def _frozen_versions(config: dict[str, Any] | None = None) -> set[str]:
+    """Version numbers that may never be re-used for a new gold set."""
+    versions = {FROZEN_DATASET_VERSION}
+    policy = (config or {}).get("dataset_policy") or {}
+    for key in ("frozen_dataset_version", "frozen_versions", "frozen_gold_versions"):
+        value = policy.get(key)
+        if isinstance(value, str):
+            versions.add(value)
+        elif isinstance(value, list):
+            versions.update(item for item in value if isinstance(item, str))
+    return versions
+
+
+def _tasks_file(directory: Path) -> Path | None:
+    path = directory / "tasks.jsonl"
+    return path if path.is_file() else None
+
+
+def _truth_file(directory: Path) -> Path | None:
+    for name in ("candidate_truth.jsonl", "truth.jsonl", "gold.jsonl", "gold_v1.jsonl"):
+        path = directory / name
+        if path.is_file():
+            return path
+    return None
+
+
+def _resolve_dataset_dir(root: Path, dataset: dict[str, Any]) -> Path | None:
+    """Find the dataset a package was scored on, if it is reachable here.
+
+    A package may point at an absolute path on the machine that produced it,
+    a path relative to the package, or carry the dataset itself. When none of
+    those resolve, the scores in the package simply cannot be recomputed —
+    which the package then has to declare.
+    """
+    candidates: list[Path] = []
+    raw = dataset.get("dataset_root")
+    if isinstance(raw, str) and raw.strip():
+        declared = Path(raw)
+        if declared.is_absolute():
+            candidates.append(declared)
+        else:
+            candidates.extend([root / declared, Path.cwd() / declared, REPO_ROOT / declared])
+    candidates.extend([root / "dataset", root])
+    for candidate in candidates:
+        try:
+            if candidate.is_dir() and _tasks_file(candidate) and _truth_file(candidate):
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _load_dialogues(truth_path: Path | None) -> list[dict[str, Any]]:
+    """Read a truth/gold file into scorer-shaped dialogues."""
+    if truth_path is None:
+        return []
+    try:
+        rows = read_jsonl(truth_path)
+    except (ValueError, OSError):
+        return []
+    dialogues: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        gold = row.get("candidate_truth")
+        if not isinstance(gold, list) and isinstance(row.get("constraints"), list):
+            gold = row["constraints"]
+        if not isinstance(gold, list):
+            continue
+        dialogues.append({
+            "dialogue_id": row.get("dialogue_id"),
+            "turns": row.get("turns") or [],
+            "candidate_truth": gold,
+            "distractors": row.get("distractors") or [],
+        })
+    return dialogues
+
+
+def _packaged_gold(files: dict[str, Any]) -> str | None:
+    for name in sorted(files):
+        if GOLD_ARTIFACT_PATTERN.search(str(name).replace("\\", "/")):
+            return str(name)
+    return None
+
+
+def _gold_provenance_findings(gold_path: Path) -> list[dict[str, Any]]:
+    """Provenance findings in a packaged gold file.
+
+    The frozen gold carries ``candidate_truth`` because the scorer reads
+    ``dialogue["candidate_truth"]``, so the container-key rule is switched
+    off here: the key name is a file format in a gold file, not a claim
+    about where the labels came from.  The unit-level and status-level
+    generator markers still apply, as do the AI markers.
+    """
+    findings: list[dict[str, Any]] = []
+    try:
+        rows = read_jsonl(gold_path)
+    except (ValueError, OSError):
+        return findings
+    generator = collect_generator_findings(rows, path="$", containers=False)
+    if generator:
+        return generator
+    return collect_provenance_findings(rows, path="$")
+
+
+def _row_output(row: Any) -> Any:
+    """The output payload of a prediction row, mirroring the scorer's fallback."""
+    if not isinstance(row, dict):
+        return None
+    if "output" in row:
+        return row["output"]
+    return {"constraints": row.get("constraints", [])}
+
+
+def _recompute_denominators(rows: list[Any], turns_by_id: dict[str, list[Any]]) -> dict[str, Any]:
+    """Recount scored/failed rows from the packaged predictions themselves.
+
+    ``invalid`` is the union of two independent signals, counted per row:
+
+    * the row's output does not satisfy the output contract (shape check, and
+      the full semantic check when the dialogue turns are available), and
+    * the row declares itself as a failure (``valid`` is false, or
+      ``failure_counted`` is true).
+
+    A package can therefore neither inflate ``scored_n`` by shipping broken
+    outputs, nor hide a failure behind a hand-written ``valid: true``.
+
+    When the benchmark dataset is reachable, the *semantic* count is the
+    authoritative one (it is what the runner itself scored with); the shape
+    count is reported next to it so a disagreement stays visible.
+    """
+    total = len(rows)
+    shape_invalid = 0
+    full_invalid = 0
+    declared_invalid = 0
+    base_invalid = 0
+    authoritative_invalid = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            shape_invalid += 1
+            full_invalid += 1
+            declared_invalid += 1
+            base_invalid += 1
+            authoritative_invalid += 1
+            continue
+        output = _row_output(row)
+        shape_ok = isinstance(output, dict) and validate_output(output, None).valid
+        if not shape_ok:
+            shape_invalid += 1
+        turns = turns_by_id.get(row.get("dialogue_id"))
+        full_ok = shape_ok and validate_output(output, turns).valid if turns is not None else shape_ok
+        if not full_ok:
+            full_invalid += 1
+        # ``valid`` mirrors the runner's own bookkeeping: a missing key means
+        # the row was never confirmed, so it cannot be counted as scored.
+        row_declared_invalid = not bool(row.get("valid")) or row.get("failure_counted") is True
+        if row_declared_invalid:
+            declared_invalid += 1
+        if not shape_ok or row_declared_invalid:
+            base_invalid += 1
+        if not full_ok or row_declared_invalid:
+            authoritative_invalid += 1
+    semantic_available = bool(turns_by_id)
+    invalid_n = authoritative_invalid if semantic_available else base_invalid
+    return {
+        "row_n": total,
+        "invalid_shape_n": shape_invalid,
+        "invalid_full_n": full_invalid,
+        "invalid_declared_n": declared_invalid,
+        "invalid_base_n": base_invalid,
+        "invalid_n": invalid_n,
+        "scored_n": total - invalid_n,
+        "failed_n": invalid_n,
+        "semantic_check_available": semantic_available,
+    }
+
+
+def _normalize_kappa_map(value: Any) -> dict[str, float]:
+    result: dict[str, float] = {}
+    if not isinstance(value, dict):
+        return result
+    for key, item in value.items():
+        number: Any = None
+        if isinstance(item, dict):
+            # AC1 is a different scale and never decides a gate in this
+            # repository. Accepting it here would publish a reported AC1 as
+            # if it were a per-class Cohen's kappa.
+            for candidate in ("kappa", "value"):
+                if isinstance(item.get(candidate), (int, float)) and not isinstance(item.get(candidate), bool):
+                    number = item[candidate]
+                    break
+        elif isinstance(item, (int, float)) and not isinstance(item, bool):
+            number = item
+        if number is not None:
+            result[str(key)] = float(number)
+    return result
+
+
+def _annotation_facts(report: dict[str, Any]) -> dict[str, Any]:
+    """Extract the facts a human_gold annotation report has to state.
+
+    Both the flat spelling used by this contract and the nested spelling of
+    ``agreement.agreement_report`` are accepted, so an existing agreement
+    report can be shipped as-is.
+    """
+    overall = report.get("overall") if isinstance(report.get("overall"), dict) else {}
+    facts: dict[str, Any] = {}
+
+    kappa = report.get("overall_kappa", report.get("kappa", overall.get("kappa")))
+    facts["overall_kappa"] = float(kappa) if isinstance(kappa, (int, float)) and not isinstance(kappa, bool) else None
+
+    facts["per_class_kappa"] = _normalize_kappa_map(
+        report.get("per_class_kappa", report.get("per_type_kappa", report.get("per_type", report.get("per_class"))))
+    )
+
+    ci = report.get("kappa_ci_lower", report.get("ci_95_lower", overall.get("kappa_ci_lower")))
+    if ci is None:
+        bootstrap = overall.get("ci_95_percentile_cluster_bootstrap")
+        if isinstance(bootstrap, list) and bootstrap and isinstance(bootstrap[0], (int, float)):
+            ci = bootstrap[0]
+    if isinstance(ci, dict):
+        ci = ci.get("overall")
+    facts["kappa_ci_lower"] = float(ci) if isinstance(ci, (int, float)) and not isinstance(ci, bool) else None
+
+    ac1 = report.get("ac1", report.get("gwet_ac1", report.get("overall_ac1", overall.get("ac1"))))
+    if isinstance(ac1, dict):
+        ac1 = ac1.get("overall")
+    facts["ac1"] = float(ac1) if isinstance(ac1, (int, float)) and not isinstance(ac1, bool) else None
+
+    unit_n = report.get(
+        "unit_n", report.get("n_units", report.get("annotated_unit_n", report.get("aligned_unit_n", overall.get("n"))))
+    )
+    facts["unit_n"] = unit_n if isinstance(unit_n, int) and not isinstance(unit_n, bool) else None
+
+    annotators = report.get("annotator_n", report.get("n_annotators"))
+    if annotators is None:
+        raw_annotators = report.get("annotators")
+        if isinstance(raw_annotators, list):
+            annotators = len(raw_annotators)
+        elif isinstance(raw_annotators, int) and not isinstance(raw_annotators, bool):
+            annotators = raw_annotators
+    facts["annotator_n"] = annotators if isinstance(annotators, int) and not isinstance(annotators, bool) else None
+
+    adjudication = report.get("adjudication_method", report.get("adjudication"))
+    if isinstance(adjudication, dict):
+        adjudication = adjudication.get("method")
+    facts["adjudication_method"] = adjudication.strip() if isinstance(adjudication, str) and adjudication.strip() else None
+
+    annotator_type = report.get("annotator_type")
+    facts["annotator_type"] = str(annotator_type).strip().lower() if isinstance(annotator_type, str) and annotator_type.strip() else None
+    facts["sources"] = report.get("sources") if isinstance(report.get("sources"), list) else []
+    return facts
+
+
+def _check_human_gold(
+    root: Path,
+    document: dict[str, Any],
+    dataset: dict[str, Any],
+    files: dict[str, Any],
+    config: dict[str, Any],
+    issues: list[dict[str, str]],
+) -> dict[str, Any]:
+    """Hard gate for ``evidence_grade == "human_gold"``.
+
+    A human gold claim is only accepted when the package actually ships the
+    gold labels, ships an annotation report that states how they were
+    produced, and the gold version is not a recycled frozen version.
+    """
+    info: dict[str, Any] = {"checked": True, "verified": False, "gold_file": None, "annotation_report": None}
+    start = len(issues)
+
+    if dataset.get("human_annotation_complete") is not True:
+        _issue(issues, "fake_human_gold", "human_gold declared without human_annotation_complete=true")
+
+    gold_version = dataset.get("gold_version")
+    if not gold_version:
+        _issue(issues, "human_gold_without_version", "human_gold requires an explicit gold_version")
+    elif gold_version in _frozen_versions(config):
+        _issue(issues, "human_gold_reuses_frozen_version",
+               f"gold_version {gold_version!r} reuses a frozen version and is not a new gold set")
+
+    gold_name = _packaged_gold(files)
+    if gold_name is None:
+        _issue(issues, "human_gold_missing_artifacts",
+               "human_gold requires a gold artifact (e.g. gold.jsonl) declared in files")
+        _issue(issues, "human_gold_without_hash",
+               "human_gold requires the gold artifact hash to be declared")
+    else:
+        info["gold_file"] = gold_name
+        gold_path = root / gold_name
+        if not gold_path.is_file():
+            _issue(issues, "human_gold_missing_artifacts", f"gold artifact {gold_name} is absent from the package")
+        else:
+            actual = sha256_file(gold_path)
+            declared = files.get(gold_name)
+            if isinstance(declared, str) and actual != declared:
+                _issue(issues, "human_gold_hash_mismatch",
+                       f"{gold_name}: declared {declared[:12]}…, actual {actual[:12]}…")
+            declared_gold_sha = dataset.get("gold_sha256")
+            if isinstance(declared_gold_sha, str) and declared_gold_sha != actual:
+                _issue(issues, "human_gold_hash_mismatch",
+                       f"{gold_name}: dataset.gold_sha256 does not match the packaged gold file")
+            # The shipped bytes are checked too, not only the report's word.
+            # A package that renames generator truth to gold.jsonl would
+            # otherwise pass this gate on the strength of its own report.
+            for finding in _gold_provenance_findings(gold_path):
+                _issue(
+                    issues,
+                    "fake_human_gold",
+                    f"{gold_name}: the packaged gold carries non-human provenance "
+                    f"({finding['path']}={finding['value']!r}, {finding['reason']})",
+                )
+                break
+            # Markers can be deleted; the labels cannot.  Compare the gold's
+            # unit content against every generator truth file shipped in the
+            # repository.  A package that strips candidate_only, rewrites the
+            # notes and changes status still matches here.
+            try:
+                gold_rows = read_jsonl(gold_path)
+            except (ValueError, OSError):
+                gold_rows = []
+            laundering = generator_truth_laundering(
+                truth_rows_as_annotations(gold_rows), repo_root=REPO_ROOT
+            )
+            info["content_fingerprint_check"] = {
+                "reference_n": laundering["reference_n"],
+                "whole_set_match_path": laundering["whole_set_match_path"],
+                "max_overlap_ratio": laundering["max_overlap_ratio"],
+                "laundered": laundering["laundered"],
+            }
+            if laundering["laundered"]:
+                hit = laundering["whole_set_match_path"] or laundering["max_overlap_path"]
+                _issue(
+                    issues,
+                    "fake_human_gold",
+                    f"{gold_name}: the packaged gold is byte-identical to {hit} "
+                    f"(whole-set match: {laundering['whole_set_match_path'] is not None}; "
+                    f"exact dialogue overlap {laundering['max_overlap_dialogue_n']}/"
+                    f"{laundering['max_overlap_reference_dialogue_n']}, threshold "
+                    f"{laundering['overlap_threshold']}); it is generator truth, not human annotation",
+                )
+
+    report_name = dataset.get("annotation_report_file")
+    if isinstance(report_name, str) and report_name:
+        candidates = [report_name]
+    else:
+        candidates = sorted(
+            str(name) for name in files
+            if ANNOTATION_REPORT_PATTERN.search(str(name).replace("\\", "/"))
+        )
+    human_report: tuple[str, dict[str, Any]] | None = None
+    ai_reports: list[str] = []
+    for name in candidates:
+        path = root / name
+        if not path.is_file():
+            _issue(issues, "human_gold_missing_artifacts", f"annotation report {name} is absent from the package")
+            continue
+        try:
+            data = read_json(path)
+        except (ValueError, OSError):
+            _issue(issues, "human_gold_report_invalid", f"{name} is not valid JSON")
+            continue
+        if not isinstance(data, dict):
+            _issue(issues, "human_gold_report_invalid", f"{name} must be a JSON object")
+            continue
+        facts = _annotation_facts(data)
+        source = facts["annotator_type"]
+        if source in AI_ANNOTATOR_TYPES:
+            ai_reports.append(name)
+            continue
+        if human_report is None:
+            human_report = (name, facts)
+
+    if human_report is None:
+        if ai_reports:
+            _issue(issues, "human_gold_annotator_not_human",
+                   f"annotation report {ai_reports[0]} is not human-annotated and cannot back a human_gold claim")
+        else:
+            _issue(issues, "human_gold_missing_artifacts",
+                   "human_gold requires an annotation report (e.g. annotation_report.json) declared in files")
+    else:
+        name, facts = human_report
+        info["annotation_report"] = name
+        missing: list[str] = []
+        if facts["annotator_type"] != "human":
+            missing.append("annotator_type=human")
+        if facts["annotator_n"] is None:
+            missing.append("annotator_n")
+        elif facts["annotator_n"] < 2:
+            _issue(issues, "human_gold_insufficient_annotators",
+                   f"{name}: annotator_n={facts['annotator_n']}; inter-annotator agreement needs at least two annotators")
+        if facts["unit_n"] is None or facts["unit_n"] <= 0:
+            missing.append("unit_n")
+        if facts["overall_kappa"] is None:
+            missing.append("overall_kappa")
+        if not facts["per_class_kappa"]:
+            missing.append("per_class_kappa")
+        if facts["kappa_ci_lower"] is None:
+            missing.append("kappa_ci_lower")
+        if facts["ac1"] is None:
+            missing.append("ac1")
+        if facts["adjudication_method"] is None:
+            missing.append("adjudication_method")
+        if missing:
+            _issue(issues, "human_gold_report_incomplete", f"{name} is missing: {', '.join(missing)}")
+
+        sources = facts["sources"]
+        if sources:
+            human_sources = [
+                item for item in sources
+                if isinstance(item, dict) and str(item.get("type", "")).strip().lower() not in AI_ANNOTATOR_TYPES
+            ]
+            ai_sources = [
+                item for item in sources
+                if isinstance(item, dict) and str(item.get("type", "")).strip().lower() in AI_ANNOTATOR_TYPES
+            ]
+            if not human_sources:
+                _issue(issues, "human_gold_annotator_not_human",
+                       f"{name}: no human annotation source; AI prechecks cannot back a human_gold claim")
+            else:
+                human_units = sum(
+                    int(item.get("unit_n", 0)) for item in human_sources
+                    if isinstance(item.get("unit_n"), int) and not isinstance(item.get("unit_n"), bool)
+                )
+                ai_units = sum(
+                    int(item.get("unit_n", 0)) for item in ai_sources
+                    if isinstance(item.get("unit_n"), int) and not isinstance(item.get("unit_n"), bool)
+                )
+                if ai_units and facts["unit_n"] is not None and facts["unit_n"] > human_units:
+                    _issue(issues, "human_gold_ai_source_counted",
+                           f"{name}: {ai_units} AI-sourced unit(s) are counted in the human annotation total")
+                for item in human_sources:
+                    value = item.get("overall_kappa", item.get("kappa"))
+                    if isinstance(value, (int, float)) and not isinstance(value, bool) and facts["overall_kappa"] is not None:
+                        if abs(float(value) - facts["overall_kappa"]) > 1e-9:
+                            _issue(issues, "human_gold_source_conflict",
+                                   f"{name}: the declared kappa disagrees with the human annotator's kappa")
+
+    info["verified"] = len(issues) == start
+    return info
+
+
+def _mentions_reproducibility(limitations: Any) -> bool:
+    if not isinstance(limitations, list):
+        return False
+    for item in limitations:
+        if not isinstance(item, str):
+            continue
+        lowered = item.lower()
+        if "reproduc" in lowered or "复现" in item:
+            return True
+    return False
+
+
 def validate_submission(directory: str | Path, *, benchmark_config_path: str | Path = DEFAULT_BENCHMARK_CONFIG) -> dict[str, Any]:
     """Validate either a run submission or a dataset extension directory.
 
@@ -409,9 +958,17 @@ def validate_submission(directory: str | Path, *, benchmark_config_path: str | P
     # cannot point this at a hand-edited config to relax version/dimension rules.
     config = benchmark_config(REPO_ROOT / DEFAULT_BENCHMARK_CONFIG)
     issues: list[dict[str, str]] = []
+    base_report: dict[str, Any] = {
+        "validator_version": VALIDATOR_VERSION,
+        "benchmark_config_source": "repo_canonical",
+        "benchmark_config_path_argument": "ignored_by_design",
+        "scores_verified": False,
+        "denominators_recomputed": False,
+        "human_gold_verified": False,
+    }
     if not root.is_dir():
         _issue(issues, "not_a_directory", f"{root} does not exist")
-        return {"valid": False, "kind": None, "issues": issues, "checked_files": 0}
+        return {**base_report, "valid": False, "kind": None, "issues": issues, "checked_files": 0}
 
     if (root / SUBMISSION_FILE).is_file():
         kind = "run_result"
@@ -421,7 +978,7 @@ def validate_submission(directory: str | Path, *, benchmark_config_path: str | P
         document = read_json(root / DATASET_FILE)
     else:
         _issue(issues, "no_manifest", f"neither {SUBMISSION_FILE} nor {DATASET_FILE} found")
-        return {"valid": False, "kind": None, "issues": issues, "checked_files": 0}
+        return {**base_report, "valid": False, "kind": None, "issues": issues, "checked_files": 0}
 
     _check_version_fields(document, config, issues)
     if kind == "run_result":
@@ -435,25 +992,176 @@ def validate_submission(directory: str | Path, *, benchmark_config_path: str | P
             _issue(issues, "duplicate_of_frozen_pilot",
                    "tasks.jsonl is byte-identical to the frozen pilot set; this is not a new sample")
 
+    files = document.get("files") if isinstance(document.get("files"), dict) else {}
     dataset = document.get("dataset", document)
-    if isinstance(dataset, dict):
-        if dataset.get("evidence_grade") == "human_gold" and dataset.get("human_annotation_complete") is not True:
-            _issue(issues, "fake_human_gold", "human_gold declared without human_annotation_complete=true")
-        if dataset.get("evidence_grade") == "human_gold":
-            # A boolean alone is self-declared. Require a gold version and its
-            # hash to be stamped, so a generator-truth set cannot be relabelled
-            # as human gold by flipping one flag.
-            if not dataset.get("gold_version"):
-                _issue(issues, "human_gold_without_version", "human_gold requires an explicit gold_version")
-            evidence = document.get("evidence", {}) if isinstance(document.get("evidence", {}), dict) else {}
-            dataset_hash = dataset.get("dataset_manifest_sha256")
-            if not dataset_hash and not evidence.get("gold_v1.jsonl"):
-                _issue(issues, "human_gold_without_hash", "human_gold requires a dataset_manifest_sha256 or gold_v1.jsonl evidence hash")
-        if dataset.get("source_type") == "real_redacted":
-            provenance = document.get("provenance", {})
-            note = provenance.get("compliance_note") if isinstance(provenance, dict) else None
-            if not note or (isinstance(note, str) and len(note.strip()) < 15):
-                _issue(issues, "missing_compliance_note", "real_redacted data requires a substantive compliance_note (>=15 chars)")
+    if not isinstance(dataset, dict):
+        dataset = {}
+    if dataset.get("source_type") == "real_redacted":
+        provenance = document.get("provenance", {})
+        note = provenance.get("compliance_note") if isinstance(provenance, dict) else None
+        if not note or (isinstance(note, str) and len(note.strip()) < 15):
+            _issue(issues, "missing_compliance_note", "real_redacted data requires a substantive compliance_note (>=15 chars)")
+
+    human_gold_info: dict[str, Any] = {"checked": False, "verified": False}
+    if dataset.get("evidence_grade") == "human_gold":
+        human_gold_info = _check_human_gold(root, document, dataset, files, config, issues)
+
+    # The dataset a package was scored on. Without it, denominators can only be
+    # recomputed from the packaged predictions, and scores cannot be checked.
+    dataset_dir = _resolve_dataset_dir(root, dataset)
+    truth_path = _truth_file(dataset_dir) if dataset_dir else None
+    packaged_gold = _packaged_gold(files)
+    if dataset.get("evidence_grade") == "human_gold" and packaged_gold:
+        truth_path = root / packaged_gold
+    dialogues = _load_dialogues(truth_path)
+    turns_by_id = {
+        dialogue["dialogue_id"]: dialogue["turns"]
+        for dialogue in dialogues if dialogue.get("dialogue_id")
+    }
+
+    denominator_report: dict[str, Any] = {"recomputed": False}
+    score_report: dict[str, Any] = {"verified": False}
+    declared_scores = document.get("scores")
+    declared_scores = declared_scores if isinstance(declared_scores, dict) else {}
+    prediction_rows: list[Any] = []
+    predictions_path: Path | None = None
+    if kind == "run_result":
+        for name in sorted(files):
+            if str(name).replace("\\", "/").rsplit("/", 1)[-1] == "predictions.jsonl":
+                predictions_path = root / str(name)
+                break
+        if predictions_path is None or not predictions_path.is_file():
+            _issue(issues, "predictions_missing",
+                   "a run submission must ship predictions.jsonl so the denominators can be recomputed")
+        else:
+            try:
+                prediction_rows = read_jsonl(predictions_path)
+            except (ValueError, OSError) as exc:
+                prediction_rows = []
+                _issue(issues, "predictions_unreadable", f"predictions.jsonl could not be parsed: {exc}")
+            recomputed = _recompute_denominators(prediction_rows, turns_by_id)
+            denominator_report = {
+                "recomputed": True,
+                "source": str(predictions_path.relative_to(root)) if predictions_path.is_relative_to(root) else str(predictions_path),
+                "row_n": recomputed["row_n"],
+                "invalid_n": recomputed["invalid_n"],
+                "invalid_shape_n": recomputed["invalid_shape_n"],
+                "invalid_full_n": recomputed["invalid_full_n"],
+                "invalid_declared_n": recomputed["invalid_declared_n"],
+                "invalid_base_n": recomputed["invalid_base_n"],
+                "scored_n": recomputed["scored_n"],
+                "failed_n": recomputed["failed_n"],
+                "semantic_check_available": recomputed["semantic_check_available"],
+            }
+            declared_denominator = document.get("run", {}).get("denominator_disclosure", {})
+            if not isinstance(declared_denominator, dict):
+                declared_denominator = {}
+            declared_dialogue_n = declared_denominator.get("dialogue_n")
+            declared_scored_n = declared_denominator.get("scored_n")
+            declared_failed_n = declared_denominator.get("failed_n")
+            if declared_dialogue_n != recomputed["row_n"]:
+                _issue(issues, "denominator_mismatch",
+                       f"dialogue_n={declared_dialogue_n!r} but predictions.jsonl holds {recomputed['row_n']} rows")
+            # The declared failure count must cover every row the validator can
+            # prove broken. When the dataset is reachable, the semantic
+            # re-validation is authoritative and must match exactly; without
+            # turns only the shape check is available, so the declared count
+            # may be larger (semantic failures are invisible here) but it may
+            # never be smaller than what the shape check proves broken.
+            if recomputed["semantic_check_available"]:
+                if declared_failed_n != recomputed["failed_n"] or declared_scored_n != recomputed["scored_n"]:
+                    _issue(issues, "denominator_mismatch",
+                           f"declared scored_n/failed_n={declared_scored_n!r}/{declared_failed_n!r}, "
+                           f"recomputed {recomputed['scored_n']}/{recomputed['failed_n']} from predictions.jsonl")
+            else:
+                if not isinstance(declared_failed_n, int) or declared_failed_n < recomputed["invalid_base_n"]:
+                    _issue(issues, "denominator_mismatch",
+                           f"declared failed_n={declared_failed_n!r} but {recomputed['invalid_base_n']} packaged "
+                           f"prediction(s) fail the output contract")
+                if not isinstance(declared_scored_n, int) or declared_scored_n > recomputed["row_n"] - recomputed["invalid_base_n"]:
+                    _issue(issues, "denominator_mismatch",
+                           f"declared scored_n={declared_scored_n!r} exceeds the "
+                           f"{recomputed['row_n'] - recomputed['invalid_base_n']} packaged prediction(s) "
+                           f"that satisfy the output contract")
+
+    # Scores: recompute them from the dataset when it is reachable, otherwise
+    # the package has to say out loud that its scores cannot be reproduced.
+    # Nothing here ever takes the package's word for a number it can check.
+    recomputed_aggregate: dict[str, Any] | None = None
+    if kind == "run_result" and dialogues and prediction_rows:
+        from .scoring import score_dataset
+        try:
+            aggregate = score_dataset(dialogues, prediction_rows)["aggregate"]
+        except (KeyError, TypeError, ValueError) as exc:
+            aggregate = {}
+            _issue(issues, "scores_unrecomputable", f"the dataset could not be re-scored: {exc}")
+        recomputed_aggregate = {
+            name: (aggregate.get(name) or {}).get("value")
+            for name in RECOMPUTABLE_METRICS
+            if isinstance(aggregate.get(name), dict)
+        }
+
+    scores_claimed = bool(declared_scores) or bool(document.get("scores_declared"))
+    score_report = {
+        "verified": False,
+        "scores_claimed": scores_claimed,
+        "declared_metrics": sorted(declared_scores),
+    }
+    if scores_claimed and recomputed_aggregate is None:
+        # The numbers cannot be checked here, so the package must say so.
+        if document.get("scores_verification") != "not_reproducible_locally":
+            _issue(issues, "scores_not_reproducible_locally",
+                   "scores are declared but cannot be reproduced here; declare "
+                   "scores_verification='not_reproducible_locally'")
+        if not _mentions_reproducibility(document.get("declared_limitations")):
+            _issue(issues, "scores_limitation_missing",
+                   "declared_limitations must state that the declared scores are not reproducible locally")
+        score_report["reason"] = "dataset_not_resolvable"
+    elif scores_claimed and recomputed_aggregate is not None:
+        if not declared_scores:
+            _issue(issues, "scores_missing",
+                   "scores_declared is true but the package ships no scores to verify")
+        mismatched: list[str] = []
+        unverifiable: list[str] = []
+        malformed: list[str] = []
+        for name, value in sorted(declared_scores.items()):
+            if name not in RECOMPUTABLE_METRICS:
+                unverifiable.append(name)
+                continue
+            computed = recomputed_aggregate.get(name)
+            if value is None and computed is None:
+                continue
+            if value is not None and (not isinstance(value, (int, float)) or isinstance(value, bool)):
+                malformed.append(name)
+                continue
+            if value is None or computed is None:
+                mismatched.append(name)
+                continue
+            if abs(float(value) - float(computed)) > SCORE_TOLERANCE:
+                mismatched.append(name)
+        for name in unverifiable:
+            _issue(issues, "unverifiable_score_metric",
+                   f"scores.{name} cannot be recomputed by the validator")
+        for name in malformed:
+            _issue(issues, "invalid_score_value", f"scores.{name} must be a number or null")
+        for name in mismatched:
+            _issue(issues, "score_mismatch",
+                   f"scores.{name} does not match the recomputed value")
+        verified = not mismatched and not unverifiable and not malformed
+        score_report.update({
+            "verified": verified,
+            "reason": "recomputed" if verified else "mismatch",
+            "tolerance": SCORE_TOLERANCE,
+            "mismatched": mismatched,
+            "unverifiable": unverifiable,
+            "malformed": malformed,
+            "recomputed": recomputed_aggregate,
+        })
+    elif document.get("scores_verification") is not None and document.get("scores_verification") != "not_reproducible_locally":
+        _issue(issues, "scores_without_scores",
+               "scores_verification is declared but no scores are shipped to verify")
+    elif recomputed_aggregate is not None:
+        score_report["recomputed"] = recomputed_aggregate
 
     if kind == "run_result":
         run = document.get("run", {})
@@ -502,11 +1210,25 @@ def validate_submission(directory: str | Path, *, benchmark_config_path: str | P
         expected_scorer = f"scoring.py@{sha256_file(scoring_path)[:12]}"
         if scorer_version != expected_scorer:
             _issue(issues, "scorer_version_mismatch", f"declared {scorer_version!r}, expected {expected_scorer!r}")
+
+    declared_validator_version = document.get("validator_version")
+    if declared_validator_version is not None and declared_validator_version != VALIDATOR_VERSION:
+        _issue(issues, "validator_version_mismatch",
+               f"package targets validator {declared_validator_version!r}, this validator is {VALIDATOR_VERSION!r}")
+
     return {
+        **base_report,
         "valid": not issues,
         "kind": kind,
         "benchmark_version": document.get("benchmark_version"),
         "submission_id": document.get("submission_id") or document.get("dataset_id"),
         "issues": issues,
         "checked_files": checked,
+        "scores_verified": bool(score_report.get("verified")),
+        "denominators_recomputed": bool(denominator_report.get("recomputed")),
+        "human_gold_verified": bool(human_gold_info.get("verified")),
+        "denominator_recomputation": denominator_report,
+        "score_verification": score_report,
+        "human_gold_verification": human_gold_info,
     }
+

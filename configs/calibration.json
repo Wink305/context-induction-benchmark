@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "state": "uncalibrated",
+  "thresholds": {
+    "text_min": 0.10,
+    "anchor_coverage_min": 0.08,
+    "evidence_iou_min": null,
+    "slot_match_required": false
+  },
+  "provenance": {
+    "calibration_set": null,
+    "calibration_set_sha256": null,
+    "annotators": [],
+    "adjudicator": null,
+    "fitted_at": null,
+    "sample_n": 0,
+    "sensitivity": null,
+    "specificity": null,
+    "split": null
+  },
+  "threshold_sources": {
+    "text_min": "src/context_benchmark/scoring.py :: TEXT_MATCH_MIN",
+    "anchor_coverage_min": "src/context_benchmark/scoring.py :: ANCHOR_COVERAGE_MIN",
+    "evidence_iou_min": "not implemented yet — the scorer does not read this key",
+    "slot_match_required": "not implemented yet — the scorer does not read this key"
+  },
+  "note": "The two thresholds that are in force today were hand-picked so that a short paraphrase of a constructed unit survives the text gate while unrelated text with perfect evidence does not. They are NOT calibrated on human labels, because no human gold exists yet. They must not be described as calibrated, and no model score may be reported until state becomes 'calibrated' with a filled provenance block. Do not tune these against generator truth: that is the self-certifying loop this file exists to prevent."
+}

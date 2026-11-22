@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from .io import canonical_json
 from .ontology import CATEGORIES, SCOPES, TYPE_TO_CODE
 
 REQUIRED_FIELDS = {
@@ -143,8 +145,115 @@ def validate_output(value: Any, turns: list[dict[str, Any]] | None = None) -> Va
 
 
 def public_constraint(item: dict[str, Any]) -> dict[str, Any]:
-    """Strip generator-only metadata before applying the model-output contract."""
+    """Strip generator-only metadata before applying the model-output contract.
+
+    Raises a diagnostic :class:`ValueError` when a required field is
+    missing.  A bare ``KeyError`` used to escape from here, which told the
+    caller neither which dialogue nor which unit was malformed.
+    """
+    missing = [key for key in BASE_FIELDS if key not in item]
+    if missing:
+        raise ValueError(
+            f"constraint {item.get('id', '<no id>')!r} is missing required "
+            f"field(s): {sorted(missing)}"
+        )
     return {key: item[key] for key in BASE_FIELDS}
+
+
+# The fields that decide what a unit *means*.  Deliberately excludes the
+# bookkeeping and provenance metadata (``id``, ``note``, ``candidate_only``,
+# ``status``, ``provenance``): a content fingerprint must survive an attempt
+# to launder the origin of a label by editing those fields.
+CONTENT_FIELDS = (
+    "type",
+    "scope",
+    "category",
+    "text",
+    "evidence_turns",
+    "valid_from",
+    "valid_to",
+    "superseded_by",
+    "rule_tags",
+)
+
+
+def annotation_content_hash(rows: list[dict[str, Any]]) -> str:
+    """A canonical fingerprint of the annotation **content** in these rows.
+
+    Used for two things:
+
+    * binding an agreement report to the annotations it was computed from,
+      so a hand-written report with fabricated gate results cannot be used
+      to freeze anything;
+    * comparing a frozen gold against the shipped generator truth, so
+      generator labels cannot be laundered into a ``human_gold`` claim by
+      editing the marker fields.
+
+    Only :data:`CONTENT_FIELDS` take part, so rewriting ``note`` or
+    ``status`` does not change the fingerprint — but changing a label does.
+    """
+    payload = []
+    for row in rows:
+        units = row_units(row)
+        payload.append(
+            {
+                "dialogue_id": row.get("dialogue_id"),
+                "units": [
+                    {field: unit.get(field) for field in CONTENT_FIELDS}
+                    for unit in units
+                ],
+            }
+        )
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def dialogue_content_hashes(rows: list[dict[str, Any]]) -> dict[str, str]:
+    """One content fingerprint per dialogue.
+
+    Used to tell *how much* of an annotation set is byte-identical to the
+    shipped generator truth.  The whole-set fingerprint below cannot say
+    that: a set that differs in one dialogue out of forty still looks
+    completely different as a whole.
+    """
+    fingerprints: dict[str, str] = {}
+    for row in rows:
+        units = row_units(row)
+        payload = [{field: unit.get(field) for field in CONTENT_FIELDS} for unit in units]
+        fingerprints[row.get("dialogue_id")] = hashlib.sha256(
+            canonical_json(payload).encode("utf-8")
+        ).hexdigest()
+    return fingerprints
+
+
+def truth_rows_as_annotations(truth_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Reshape a truth file's ``candidate_truth`` into annotation rows.
+
+    The generator's truth file and a parsed annotation file hold the same
+    units under different keys.  This makes them comparable by
+    :func:`annotation_content_hash` without pretending they are the same
+    format.
+    """
+    return [
+        {
+            "dialogue_id": row.get("dialogue_id"),
+            "annotations": row.get("candidate_truth") or [],
+        }
+        for row in truth_rows
+    ]
+
+
+def row_units(row: dict[str, Any]) -> list[dict[str, Any]]:
+    """The units carried by one dialogue's annotation row.
+
+    ``annotations`` is the contract key — the annotation worksheet uses it,
+    and so do the agreement gate and the adjudication gate.  ``constraints``
+    is the legacy alias; both are accepted, so an older or hand-authored
+    artefact still loads instead of silently agreeing on zero units.
+    """
+    units = row.get("annotations")
+    if not isinstance(units, list):
+        units = row.get("constraints")
+    return units if isinstance(units, list) else []
 
 
 def validate_candidate_dialogue(dialogue: dict[str, Any]) -> ValidationReport:

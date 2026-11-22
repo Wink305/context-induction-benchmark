@@ -4,6 +4,14 @@ The sheet is a Markdown file per dialogue.  The annotator writes one line per
 constraint unit between two HTML comment markers.  This module only converts
 between that plain-text form and the JSON records used by the scorer; it never
 guesses labels on the annotator's behalf.
+
+The answer-free render (the default, without ``--truth``) is **uniform**: every
+segment gets the same neutral guidance, so no sheet can hint at which segments
+carry constraints.  Structural hints are derived from an explicitly supplied
+truth file and are opt-in, for the manual author only.
+
+``P0_标注链与金标冻结.md`` states what each artifact in the annotation area
+is — and what it is not.
 """
 
 from __future__ import annotations
@@ -12,10 +20,21 @@ import re
 from pathlib import Path
 from typing import Any, Iterable
 
-from .io import read_jsonl, write_json, write_jsonl
+from .io import read_json, read_jsonl, write_json, write_jsonl
 
 ANSWER_START = "<!-- ANSWER_START -->"
 ANSWER_END = "<!-- ANSWER_END -->"
+
+# The only hint an answer-free sheet may carry.  It is identical for every
+# segment and says nothing about whether the segment holds constraints.
+NEUTRAL_HINT = "按《P0_标注手册_v1.md》逐条判断用户侧约束；只标能确定是约束的条目。"
+
+# Rendering a sheet happens *before* anyone annotates it, so the renderer
+# cannot claim a human origin for the answers.  A directory that does not
+# say where its answers came from stays "unknown" — never silently promoted
+# to "human" just because a parser read it.
+UNANNOTATED_SHEETS = "unannotated_sheets"
+UNKNOWN_PROVENANCE = "unknown"
 
 TYPE_ALIASES = {
     "s": "standing",
@@ -63,6 +82,19 @@ CATEGORY_ALIASES = {
     "业务": "domain",
 }
 
+# The eight boundary rules from 《P0_标注手册_v1.md》§5.  They are the rules
+# that exist precisely to stop two people labelling the same unit
+# differently, so they are a *linguistic* judgement (is this phrasing
+# rule-like? is this a bare fact?).
+#
+# They therefore CANNOT be recovered from the output fields.  Measured on the
+# shipped pilot: 113 units share the shape (type=one_off, scope=task), and
+# only 35 of them are R1 — the other 78 are incidental one-offs such as
+# 「本工单暂不升级并等待次日确认」.  A field-based derivation mislabels 148 of
+# 420 units (35 %).  So the tag is collected from the annotator, in the
+# sheet's seventh column, and never inferred.
+RULE_TAGS = ("R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8")
+
 
 def _norm_token(text: str) -> str:
     return re.sub(r"[\s`'\"（）()\[\]]", "", text).strip().lower()
@@ -102,6 +134,28 @@ def _parse_end(text: str) -> tuple[int | None, str | None]:
         turn = int(withdrawn.group(1))
         return turn - 1, None
     raise ValueError(f"失效说明里找不到轮次：{raw!r}")
+
+
+def _parse_rule_tags(text: str) -> list[str]:
+    """Parse the seventh column (边界标签) into a list of R codes.
+
+    Accepts ``R8`` or ``R3,R8`` (Chinese commas and spaces are tolerated).
+    An empty cell means "no boundary rule decided this unit", which is a
+    legitimate answer and must not be an error.
+    """
+    raw = text.strip()
+    if not raw:
+        return []
+    tags: list[str] = []
+    for chunk in re.split(r"[,，、/\s]+", raw):
+        if not chunk:
+            continue
+        code = chunk.strip().upper()
+        if code not in RULE_TAGS:
+            raise ValueError(f"边界标签无法识别：{chunk!r}（应为 {'/'.join(RULE_TAGS)} 之一）")
+        if code not in tags:
+            tags.append(code)
+    return tags
 
 
 def parse_answer_block(text: str) -> tuple[list[dict[str, Any]], list[str]]:
@@ -148,17 +202,22 @@ def parse_answer_block(text: str) -> tuple[list[dict[str, Any]], list[str]]:
                 raise ValueError("T 类必须填写失效说明（撤回或替换的轮次）")
             if kind != "superseded" and note:
                 raise ValueError(f"只有 T 类才填失效说明，当前类型是 {kind}")
+            rule_tags = _parse_rule_tags(parts[6]) if len(parts) > 6 else []
             records.append(
                 {
                     "type": kind,
                     "scope": scope,
                     "category": category,
-                    "content": content,
+                    # ``text`` is the contract field name (validation.REQUIRED_FIELDS).
+                    # The sheet column is called 内容摘要, but downstream code
+                    # (matcher, validator, public_constraint) reads ``text``.
+                    "text": content,
                     "evidence_turns": turns,
                     "valid_from": min(turns),
                     "valid_to": valid_to,
                     "superseded_by": None,
                     "_replaced_turn": replaced_turn,
+                    "_rule_tags": rule_tags,
                     "question": question,
                 }
             )
@@ -193,11 +252,28 @@ def _link_superseded(records: list[dict[str, Any]], problems: list[str]) -> None
         record.pop("_replaced_turn", None)
 
 
-def finalize_records(records: list[dict[str, Any]], prefix: str) -> list[dict[str, Any]]:
+def finalize_records(
+    records: list[dict[str, Any]], provenance: str = UNKNOWN_PROVENANCE
+) -> list[dict[str, Any]]:
+    """Give every parsed unit the identifiers the output contract requires.
+
+    The id is ``c<number>`` and unique **within its dialogue**, exactly like
+    the generator's own truth file and like a model prediction.  The
+    annotation sheet is meant to produce the same artefact the model
+    produces, so it has to satisfy ``validation.REQUIRED_FIELDS`` — a
+    dialogue-prefixed id such as ``p0-001-a001`` fails the ``c<number>``
+    check and could never be frozen or scored.
+    """
     for index, record in enumerate(records, start=1):
-        record["id"] = f"{prefix}-a{index:03d}"
-        record.setdefault("note", "human annotation")
-        record.setdefault("rule_tags", [])
+        record["id"] = f"c{index:03d}"
+        # The note used to be stamped "human annotation" unconditionally,
+        # which let an AI pre-check directory parse into rows claiming a
+        # human origin.  The note now reflects the declared source.
+        record.setdefault("note", f"{provenance} annotation")
+        # The boundary tags arrive under a private key so a malformed cell
+        # cannot silently become an empty list.  They are the annotator's own
+        # boundary judgement, carried into the agreement gate.
+        record["rule_tags"] = record.pop("_rule_tags", []) or []
     for record in records:
         position = record.pop("_superseded_index", None)
         if position is not None:
@@ -206,7 +282,17 @@ def finalize_records(records: list[dict[str, Any]], prefix: str) -> list[dict[st
 
 
 def _focus_hints(dialogue: dict[str, Any]) -> list[str]:
-    truth = dialogue.get("candidate_truth", [])
+    """Hints for one segment.
+
+    Without a truth file the sheet must stay answer-free, so the hint block is
+    the single neutral line — the same for every segment, empty or not.  A
+    hint that says "this segment has no constraints" would leak the answer, so
+    it may only appear when a truth file was supplied explicitly (the opt-in
+    path for the manual author).
+    """
+    if "candidate_truth" not in dialogue:
+        return [NEUTRAL_HINT]
+    truth = dialogue.get("candidate_truth") or []
     hints: list[str] = []
     if not truth:
         hints.append(
@@ -227,7 +313,7 @@ def _focus_hints(dialogue: dict[str, Any]) -> list[str]:
         hints.append("本段有**事实陈述**（如过敏、住址），只有当它蕴含行为要求时才标。")
     if "R8" in tags:
         hints.append("本段同一要求可能**出现两次**（一次规则化、一次单独提），合并成一条而不是两条。")
-    return hints
+    return hints or [NEUTRAL_HINT]
 
 
 def render_sheet(
@@ -243,7 +329,7 @@ def render_sheet(
         text = str(turn["text"]).replace("|", "｜")
         rows.append(f"| {turn['turn']} | {speaker} | {text} |")
     hints = _focus_hints(dialogue)
-    hint_block = "\n".join(f"- {item}" for item in hints) if hints else "- 常规段落，按手册逐条判断即可。"
+    hint_block = "\n".join(f"- {item}" for item in hints) if hints else f"- {NEUTRAL_HINT}"
     tag = "校准集" if calibration else "正式标注"
     return f"""# 标注工作表 · {dialogue['dialogue_id']}
 
@@ -262,7 +348,7 @@ def render_sheet(
 
 ## 三、答案区
 
-格式：`依据轮次 | 类型 | 作用域 | 类别 | 内容摘要 | 失效说明`
+格式：`依据轮次 | 类型 | 作用域 | 类别 | 内容摘要 | 失效说明 | 边界标签`
 
 - 依据轮次：写出该约束出现的用户轮次，多处用逗号分隔（如 `2,4,6`）
 - 类型：`S` 稳定 / `O` 一次性 / `I` 隐含 / `T` 已失效
@@ -270,17 +356,24 @@ def render_sheet(
 - 类别：`C` 沟通 / `P` 流程 / `D` 业务
 - 内容摘要：一句话，不超过 20 字
 - 失效说明：**只有 T 类填**，写撤回轮次（如 `8`）或 `被 10 轮替代`；其他留空
+- 边界标签：写这条标注是靠哪条边界规则做出来的（`R1`–`R8`，可留空）。
+  次数类判断（几次才算 I）写 `R2`；同一要求出现两次合并写 `R8`；显式撤回写 `R3`；
+  新规则替换旧规则，旧条目写 `R7`；语气像规则但绑定某个对象写 `R1`；
+  事实陈述里蕴含行为要求写 `R5`。
 
 > 下面的例子是一段**虚构对话**的格式演示，轮次和内容都与你手上的题目无关，
 > 照抄不会得到任何分数。请只把它当作「一行该长什么样」的参考。
 >
-> 虚构对话：第 2 轮用户说「以后文件都用蓝色封面」；第 8 轮说「蓝色封面那条取消」；
-> 第 4、6、10 轮用户三次说「附件别超过两页」。
+> 虚构对话：第 2 轮用户说「以后办公区打印默认双面黑白」；
+> 第 5 轮说「这次报销只收电子凭证，纸质不算」；
+> 第 3、7、11 轮分别提到「新同事对碳粉味敏感」「打印房通风不好」「闻到碳粉会头疼」；
+> 第 4 轮说「会议室预约先按老办法走」，第 9 轮说「老办法作废，统一用内部系统」。
 示例：
 ```
-2 | S | global | D | 文件用蓝色封面 |
-8 | T | global | D | 文件用蓝色封面 | 10
-4,6,10 | I | global | P | 附件不超过两页 |
+2 | S | global | D | 打印默认双面黑白 |  | 
+5 | O | task | P | 本次报销只收电子凭证 |  | 
+3,7,11 | I | global | D | 打印房避开碳粉 |  | R5
+4,9 | T | global | P | 会议室走旧预约办法 | 9 | R7
 ```
 
 在下面两行注释之间逐行填写，不要删除注释标记：
@@ -334,6 +427,11 @@ def make_sheets(
             source = truth_by_id.get(dialogue["dialogue_id"], {})
             sheet_input["candidate_truth"] = source.get("candidate_truth", [])
             sheet_input["distractors"] = source.get("distractors", [])
+        else:
+            # Drop any trace of a label: the answer-free render must be the
+            # same for every segment, whether it holds constraints or not.
+            sheet_input.pop("candidate_truth", None)
+            sheet_input.pop("distractors", None)
         path.write_text(
             render_sheet(
                 sheet_input,
@@ -347,6 +445,10 @@ def make_sheets(
         created.append(str(path))
     manifest = {
         "annotator": annotator,
+        # Rendering is not annotation.  Recording this here prevents the
+        # parser from treating a freshly rendered, still-empty sheet set as
+        # evidence that a human produced the answers.
+        "provenance": UNANNOTATED_SHEETS,
         "sheets": len(created),
         "calibration": sorted(cal & {d["dialogue_id"] for d in dialogues}),
         "hints_from_truth": truth_path is not None,
@@ -356,8 +458,33 @@ def make_sheets(
     return manifest
 
 
-def parse_sheets(sheet_dir: str | Path, annotator: str = "A") -> dict[str, Any]:
+def _resolve_sheet_provenance(directory: Path, provenance: str | None) -> str:
+    """Where the answers came from, as declared by a party who knows.
+
+    Explicit declaration wins.  Otherwise the rendering manifest is checked:
+    ``unannotated_sheets`` means the renderer produced the directory, not a
+    human, so it is *not* a provenance claim for the answers.  Anything
+    undeclared resolves to ``unknown`` — an unknown origin is never promoted
+    to ``human`` by the mere act of parsing the files.
+    """
+    if provenance is not None and str(provenance).strip():
+        return str(provenance).strip()
+    manifest_path = directory / "_manifest.json"
+    if manifest_path.is_file():
+        try:
+            declared = (read_json(manifest_path) or {}).get("provenance")
+        except (OSError, ValueError):
+            declared = None
+        if isinstance(declared, str) and declared.strip() and declared.strip() != UNANNOTATED_SHEETS:
+            return declared.strip()
+    return UNKNOWN_PROVENANCE
+
+
+def parse_sheets(
+    sheet_dir: str | Path, annotator: str = "A", provenance: str | None = None
+) -> dict[str, Any]:
     directory = Path(sheet_dir)
+    resolved_provenance = _resolve_sheet_provenance(directory, provenance)
     paths = sorted(p for p in directory.glob("*.md"))
     annotations: list[dict[str, Any]] = []
     problems: list[dict[str, Any]] = []
@@ -378,23 +505,39 @@ def parse_sheets(sheet_dir: str | Path, annotator: str = "A") -> dict[str, Any]:
                     {
                         "dialogue_id": dialogue_id,
                         "evidence_turns": record["evidence_turns"],
-                        "content": record["content"],
+                        # The parsed unit carries ``text`` (the contract field
+                        # name).  The sheet column is called 内容摘要, but the
+                        # matcher, validator and public_constraint all read
+                        # ``text`` — reading ``content`` here raised KeyError
+                        # on every sheet that used the #疑问 marker.
+                        "text": record["text"],
                         "question": question,
                     }
                 )
-        records = finalize_records(records, dialogue_id)
+        records = finalize_records(records, resolved_provenance)
         annotations.append(
             {
                 "dialogue_id": dialogue_id,
                 "annotator": annotator,
                 "status": "annotated",
+                # Only a declared origin may be claimed here. Parsing a
+                # directory is not evidence that a human filled it in.
+                "provenance": resolved_provenance,
+                # ``annotations`` is the contract key.  The worksheet, the
+                # agreement gate and the adjudication gate all read it; a
+                # previous version emitted ``constraints`` here and the whole
+                # chain silently agreed on zero units.
+                "annotations": records,
+                # ``constraints`` stays as an alias so older artefacts keep
+                # loading.  It is the same list object, never a copy.
                 "constraints": records,
             }
         )
     return {
         "annotator": annotator,
+        "provenance": resolved_provenance,
         "sheet_n": len(paths),
-        "annotated_n": len([row for row in annotations if row["constraints"]]),
+        "annotated_n": len([row for row in annotations if row["annotations"]]),
         "empty_sheets": empty,
         "problems": problems,
         "questions": questions,

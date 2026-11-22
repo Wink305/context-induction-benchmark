@@ -3,9 +3,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from context_benchmark.io import read_json, sha256_file, write_json, write_jsonl
+from context_benchmark.io import read_json, read_jsonl, sha256_file, write_json, write_jsonl
 from context_benchmark.manifest import (
-    REPO_ROOT, build_dataset_manifest, build_run_manifest, validate_submission,
+    REPO_ROOT, _normalize_kappa_map, build_dataset_manifest, build_run_manifest,
+    validate_submission,
 )
 
 BENCHMARK_CONFIG = Path(__file__).resolve().parents[1] / "configs/benchmark.json"
@@ -132,12 +133,183 @@ class RunSubmissionTests(unittest.TestCase):
         write_json(self.package / "submission.json", document)
         self.assertIn("fake_human_gold", _codes(self.validate()))
 
+    def test_generator_truth_shipped_as_gold_is_rejected(self):
+        """A package must not be able to rename generator truth to gold.jsonl.
+
+        The annotation report is written to look perfect — human annotator
+        type, two annotators, a plausible kappa.  The gate that stops this
+        is the one that reads the **shipped bytes**, not the report.
+        """
+        gold = self.package / "gold.jsonl"
+        shutil.copyfile("data/pilot_v0/candidate_truth.jsonl", gold)
+        report = self.package / "annotation_report.json"
+        write_json(report, {
+            "annotator_type": "human",
+            "annotator_n": 2,
+            "unit_n": 420,
+            "overall_kappa": 0.88,
+            "per_class_kappa": {"standing": 0.91, "one_off": 0.84},
+            "kappa_ci_lower": 0.80,
+            "ac1": 0.89,
+            "adjudication_method": "third_reviewer_decision_per_conflict",
+        })
+        document = read_json(self.package / "submission.json")
+        document["files"]["gold.jsonl"] = sha256_file(gold)
+        document["files"]["annotation_report.json"] = sha256_file(report)
+        document["dataset"]["evidence_grade"] = "human_gold"
+        document["dataset"]["human_annotation_complete"] = True
+        document["dataset"]["gold_version"] = "v1.0"
+        document["dataset"]["gold_sha256"] = sha256_file(gold)
+        document["dataset"]["annotation_report_file"] = "annotation_report.json"
+        write_json(self.package / "submission.json", document)
+        codes = _codes(self.validate())
+        self.assertIn("fake_human_gold", codes)
+
+    def test_laundered_generator_truth_is_rejected_by_content(self):
+        """Deleting the markers must not change the verdict.
+
+        This is the attack the marker-level gate could not catch: rename the
+        truth file to gold.jsonl, set status to "annotated", rewrite every
+        note to "human annotation", and delete candidate_only.  The 420
+        labels are still the generator's, word for word.
+        """
+        source = read_jsonl("data/pilot_v0/candidate_truth.jsonl")
+        gold_rows = []
+        for row in source:
+            cleaned = dict(row)
+            cleaned["status"] = "annotated"
+            for unit in cleaned["candidate_truth"]:
+                unit.pop("candidate_only", None)
+                unit["note"] = "human annotation"
+            gold_rows.append(cleaned)
+        gold = self.package / "gold.jsonl"
+        write_jsonl(gold, gold_rows)
+        report = self.package / "annotation_report.json"
+        write_json(report, {
+            "annotator_type": "human", "annotator_n": 2, "unit_n": 420,
+            "overall_kappa": 0.88,
+            "per_class_kappa": {"standing": 0.91, "one_off": 0.84},
+            "kappa_ci_lower": 0.80, "ac1": 0.89,
+            "adjudication_method": "third_reviewer_decision_per_conflict",
+        })
+        document = read_json(self.package / "submission.json")
+        document["files"]["gold.jsonl"] = sha256_file(gold)
+        document["files"]["annotation_report.json"] = sha256_file(report)
+        document["dataset"]["evidence_grade"] = "human_gold"
+        document["dataset"]["human_annotation_complete"] = True
+        document["dataset"]["gold_version"] = "v1.0"
+        document["dataset"]["gold_sha256"] = sha256_file(gold)
+        document["dataset"]["annotation_report_file"] = "annotation_report.json"
+        write_json(self.package / "submission.json", document)
+        result = self.validate()
+        self.assertIn("fake_human_gold", _codes(result))
+        detail = next(
+            issue["message"] for issue in result["issues"]
+            if issue["code"] == "fake_human_gold"
+        )
+        self.assertIn("candidate_truth.jsonl", detail)
+        self.assertIn("byte-identical", detail)
+
+    def test_ac1_is_not_published_as_per_class_kappa(self):
+        """AC1 is reported only; it must never wear kappa's label."""
+        self.assertEqual(_normalize_kappa_map({"implicit": {"gwet_ac1": 0.92}}), {})
+        self.assertEqual(_normalize_kappa_map({"implicit": {"ac1": 0.92}}), {})
+        # A real kappa still parses.
+        self.assertEqual(
+            _normalize_kappa_map({"implicit": {"kappa": 0.81, "gwet_ac1": 0.95}}),
+            {"implicit": 0.81},
+        )
+
+    def test_a_frozen_gold_file_is_not_mistaken_for_generator_output(self):
+        """The frozen gold carries candidate_truth; that is a file format."""
+        gold = self.package / "gold.jsonl"
+        write_jsonl(gold, [{
+            "dialogue_id": "x-001",
+            "status": "human_adjudicated_gold",
+            "gold_provenance": "human",
+            "gold_version": "v1.0",
+            "turns": [{"turn": 1, "speaker": "user", "text": "以后只用邮件"}],
+            "candidate_truth": [{
+                "id": "c001", "type": "standing", "text": "只用邮件",
+                "evidence_turns": [1], "valid_from": 1, "valid_to": None,
+                "scope": "global", "superseded_by": None, "category": "communication",
+            }],
+            "constraints": [{
+                "id": "c001", "type": "standing", "text": "只用邮件",
+                "evidence_turns": [1], "valid_from": 1, "valid_to": None,
+                "scope": "global", "superseded_by": None, "category": "communication",
+            }],
+        }])
+        report = self.package / "annotation_report.json"
+        write_json(report, {
+            "annotator_type": "human", "annotator_n": 2, "unit_n": 1,
+            "overall_kappa": 0.9, "per_class_kappa": {"standing": 0.9},
+            "kappa_ci_lower": 0.8, "ac1": 0.9,
+            "adjudication_method": "third_reviewer_decision_per_conflict",
+        })
+        document = read_json(self.package / "submission.json")
+        document["files"]["gold.jsonl"] = sha256_file(gold)
+        document["files"]["annotation_report.json"] = sha256_file(report)
+        document["dataset"]["evidence_grade"] = "human_gold"
+        document["dataset"]["human_annotation_complete"] = True
+        document["dataset"]["gold_version"] = "v1.0"
+        document["dataset"]["gold_sha256"] = sha256_file(gold)
+        document["dataset"]["annotation_report_file"] = "annotation_report.json"
+        write_json(self.package / "submission.json", document)
+        self.assertNotIn("fake_human_gold", _codes(self.validate()))
+
     def test_scores_declared_requires_primary_dimension(self):
         self.mutate(scores_declared=True, dimensions_reported=["B"])
         codes = _codes(self.validate())
         self.assertIn("primary_dimension_A_missing_from_ranked_report", codes)
         self.build(scores_declared=True, dimensions_reported=["A", "C", "D"])
         self.assertTrue(self.validate()["valid"])
+
+    def test_declared_scores_without_verification_are_rejected(self):
+        """A package that claims scores must say how they were obtained."""
+        self.build(scores_declared=True, dimensions_reported=["A"])
+        document = read_json(self.package / "submission.json")
+        document.pop("scores_verification", None)
+        write_json(self.package / "submission.json", document)
+        self.assertIn("missing_scores_verification", _codes(self.validate()))
+
+    def test_unverifiable_scores_must_say_so(self):
+        """No dataset on this machine => the package has to declare it."""
+        self.build(scores_declared=True, dimensions_reported=["A"])
+        document = read_json(self.package / "submission.json")
+        # The temp dataset has no candidate_truth.jsonl, so nothing can be
+        # recomputed and the package must not pretend otherwise.
+        self.assertEqual(document["scores_verification"], "not_reproducible_locally")
+        self.assertEqual(document["scores"], {})
+        # ... and because it declared that honestly, the validator accepts it.
+        self.assertNotIn("scores_not_reproducible_locally", _codes(self.validate()))
+        report = self.validate()
+        self.assertTrue(report["valid"], report["issues"])
+        self.assertFalse(report["scores_verified"])
+
+    def test_silent_scores_are_rejected(self):
+        """A package claiming scores but not declaring how is refused."""
+        self.build(scores_declared=True, dimensions_reported=["A"])
+        document = read_json(self.package / "submission.json")
+        document.pop("scores_verification", None)
+        write_json(self.package / "submission.json", document)
+        self.assertIn("missing_scores_verification", _codes(self.validate()))
+
+    def test_claimed_reproduction_without_scores_is_rejected(self):
+        self.build(scores_declared=True, dimensions_reported=["A"])
+        document = read_json(self.package / "submission.json")
+        document["scores_verification"] = "reproduced_locally"
+        document["scores"] = {}
+        write_json(self.package / "submission.json", document)
+        self.assertIn("scores_without_values", _codes(self.validate()))
+
+    def test_unverifiable_scores_must_mention_the_limitation(self):
+        """Saying 'not reproducible' is not enough; the limitations must say so."""
+        self.build(scores_declared=True, dimensions_reported=["A"])
+        document = read_json(self.package / "submission.json")
+        document["declared_limitations"] = ["No human gold and no inter-annotator agreement."]
+        write_json(self.package / "submission.json", document)
+        self.assertIn("scores_limitation_missing", _codes(self.validate()))
 
     def test_denominator_must_add_up(self):
         document = read_json(self.package / "submission.json")

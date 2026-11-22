@@ -6,13 +6,16 @@ validated semantic judge. P0 must calibrate or replace it before any model claim
 
 from __future__ import annotations
 
+import json
 from collections import Counter, defaultdict
+from pathlib import Path
 from typing import Any, Iterable
 
 from .ontology import ACTIVE_TYPES, TYPE_TO_CODE
+from .semantic import semantic_conflict
 from .validation import public_constraint, validate_output
 
-MATCHER_VERSION = "evidence_char_ngram_greedy_v2_text_gated"
+MATCHER_VERSION = "evidence_char_ngram_greedy_v3_text_gated_semantic_guard"
 # These gates are UNCALIBRATED engineering heuristics. They were chosen so that
 # a hand-written short paraphrase of a constructed unit survives while pure
 # garbage (unrelated text with perfect evidence) does not. No human annotation
@@ -20,10 +23,57 @@ MATCHER_VERSION = "evidence_char_ngram_greedy_v2_text_gated"
 # these thresholds must not be described as "calibrated on human prechecks".
 # P1 must fit them on an independent, human-labelled calibration set and report
 # sensitivity before any model score is reported. See design doc §5 and §11.2.
-TEXT_MATCH_MIN = 0.10
+TEXT_MATCH_MIN_DEFAULT = 0.10
 # The predicted text must also be recoverable from the user turns it cites.
 # Coverage = |bigrams(text) ∩ bigrams(cited turns)| / |bigrams(text)|.
-ANCHOR_COVERAGE_MIN = 0.08
+ANCHOR_COVERAGE_MIN_DEFAULT = 0.08
+
+
+def _load_thresholds() -> tuple[float, float, dict[str, Any]]:
+    """Return the effective gates and where they came from.
+
+    A calibration nobody reads is a decoration. When
+    ``configs/calibration.json`` exists and declares ``state: "calibrated"``,
+    its numbers are the ones in force; otherwise the built-in defaults are.
+    The file is read once at import time and the result is reported in every
+    score so a score can never be read without knowing which thresholds
+    produced it.
+    """
+    path = Path(__file__).resolve().parents[2] / "configs" / "calibration.json"
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return (
+            TEXT_MATCH_MIN_DEFAULT,
+            ANCHOR_COVERAGE_MIN_DEFAULT,
+            {"state": "unavailable", "source": "built_in_default"},
+        )
+    state = config.get("state", "uncalibrated")
+    if state != "calibrated":
+        return (
+            TEXT_MATCH_MIN_DEFAULT,
+            ANCHOR_COVERAGE_MIN_DEFAULT,
+            {"state": state, "source": "built_in_default"},
+        )
+    thresholds = config.get("thresholds") or {}
+    try:
+        text_min = float(thresholds["text_min"])
+        anchor_min = float(thresholds["anchor_coverage_min"])
+    except (KeyError, TypeError, ValueError):
+        return (
+            TEXT_MATCH_MIN_DEFAULT,
+            ANCHOR_COVERAGE_MIN_DEFAULT,
+            {"state": state, "source": "built_in_default",
+             "warning": "the calibration config declares 'calibrated' but has no usable thresholds"},
+        )
+    return (
+        text_min,
+        anchor_min,
+        {"state": state, "source": "configs/calibration.json"},
+    )
+
+
+TEXT_MATCH_MIN, ANCHOR_COVERAGE_MIN, THRESHOLD_SOURCE = _load_thresholds()
 CONTENT_TEXT_MIN = TEXT_MATCH_MIN
 
 
@@ -74,18 +124,28 @@ def unit_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:
 def greedy_match(
     gold: list[dict[str, Any]], predictions: list[dict[str, Any]], threshold: float = 0.32,
     *, turns: dict[int, dict[str, Any]] | None = None,
+    text_min: float | None = None, anchor_min: float | None = None,
 ) -> tuple[list[tuple[int, int, float]], list[int], list[int]]:
+    """Match predictions against gold units.
+
+    ``text_min`` and ``anchor_min`` default to the module-level gates and are
+    overridable so that ``scripts/fit_thresholds.py`` can evaluate a grid of
+    thresholds without mutating the process-wide constants. The default
+    behaviour is unchanged.
+    """
+    effective_text_min = TEXT_MATCH_MIN if text_min is None else text_min
+    effective_anchor_min = ANCHOR_COVERAGE_MIN if anchor_min is None else anchor_min
     candidates = []
     for gi, gold_item in enumerate(gold):
         for pi, prediction in enumerate(predictions):
             text_sim = _dice(_ngrams(gold_item.get("text", "")), _ngrams(prediction.get("text", "")))
             # Hard text gate: a perfect evidence overlap must not be enough to
             # match a prediction whose text has nothing to do with the gold.
-            if text_sim < TEXT_MATCH_MIN:
+            if text_sim < effective_text_min:
                 continue
             if turns is not None and anchor_coverage(
                 prediction.get("text", ""), turns, prediction.get("evidence_turns", [])
-            ) < ANCHOR_COVERAGE_MIN:
+            ) < effective_anchor_min:
                 continue
             score = unit_similarity(gold_item, prediction)
             if score >= threshold:
@@ -145,6 +205,7 @@ def score_dialogue(dialogue: dict[str, Any], prediction_row: dict[str, Any]) -> 
     supersession_links_correct = 0
     tp_by_type = Counter()
     content_ok_n = 0
+    semantic_conflict_n = 0
     pred_by_type = Counter(item.get("type") for item in predictions)
     gold_by_type = Counter(item["type"] for item in gold)
 
@@ -154,13 +215,22 @@ def score_dialogue(dialogue: dict[str, Any], prediction_row: dict[str, Any]) -> 
         content_ok = False
         if matched_prediction:
             text_sim = _dice(_ngrams(item["text"]), _ngrams(matched_prediction.get("text", "")))
+            # Semantic guard: a prediction that quotes the gold sentence and
+            # then tells the reader not to follow it ("不要遵守本条", "改为完全
+            # 相反的操作"), or that names the opposite value of the same slot
+            # ("只用邮件" where the user said "只用短信"), is not a correct
+            # constraint no matter how much text it shares.
+            conflict = semantic_conflict(item["text"], matched_prediction.get("text", ""))
             content_ok = (
                 text_sim >= CONTENT_TEXT_MIN
                 and anchor_coverage(
                     matched_prediction.get("text", ""), turn_map,
                     matched_prediction.get("evidence_turns", []),
                 ) >= ANCHOR_COVERAGE_MIN
+                and not conflict["conflicted"]
             )
+            if conflict["conflicted"]:
+                semantic_conflict_n += 1
         content_ok_n += int(content_ok)
         correct_type = bool(matched_prediction and content_ok and matched_prediction.get("type") == item["type"])
         correct_scope = bool(matched_prediction and content_ok and matched_prediction.get("scope") == item["scope"])
@@ -222,6 +292,9 @@ def score_dialogue(dialogue: dict[str, Any], prediction_row: dict[str, Any]) -> 
             "text_min": CONTENT_TEXT_MIN,
             "anchor_coverage_min": ANCHOR_COVERAGE_MIN,
             "content_ok_n": content_ok_n,
+            "semantic_conflict_n": semantic_conflict_n,
+            "semantic_guard": "slot_opposition_and_meta_override_v1",
+            "semantic_guard_calibrated": False,
         },
         "must_include": mpa,
         "must_exclude_absence": faa,
@@ -290,6 +363,12 @@ def score_dataset(dialogues: list[dict[str, Any]], prediction_rows: list[dict[st
         "metric_version": "a-c-v1-text-gated",
         "matcher_version": MATCHER_VERSION,
         "matcher_calibrated": False,
+        "scoring_thresholds": {
+            "text_min": TEXT_MATCH_MIN,
+            "anchor_coverage_min": ANCHOR_COVERAGE_MIN,
+            "source": THRESHOLD_SOURCE.get("source"),
+            "calibration_state": THRESHOLD_SOURCE.get("state"),
+        },
         "scientific_status": "engineering_baseline_not_a_model_result",
         "per_dialogue": rows,
         "aggregate": aggregate,
@@ -353,6 +432,7 @@ def score_counterfactual(probe_results: list[dict[str, Any]]) -> dict[str, Any]:
     false_trigger = []
     unclassified_related_n = 0
     unscorable_probes_n = 0
+    semantics_seen: set[str] = set()
     for probe_id, arms in grouped.items():
         if not {"true", "none", "fake"} <= set(arms):
             continue
@@ -374,11 +454,22 @@ def score_counterfactual(probe_results: list[dict[str, Any]]) -> dict[str, Any]:
         fake_deltas.append(means["fake"] - means["none"])
         negative_transfer.append(int(means["true"] < means["none"]))
         related = arms["true"][0].get("related")
+        # What does compliant=1 mean for this probe? Two conventions exist and
+        # they invert the false-trigger direction:
+        #   follows_injection — compliant=1 means the behaviour applied the
+        #       injected rule; a false trigger is then true > none.
+        #   task_correct — compliant=1 means the behaviour was correct for the
+        #       task; applying an irrelevant rule makes it wrong, so a false
+        #       trigger is then true < none.
+        # Mixing the two silently produced a false-trigger rate of exactly 0
+        # in one direction. The convention is read from the probe row.
+        semantics = arms["true"][0].get("compliant_semantics") or "follows_injection"
+        semantics_seen.add(semantics)
         if related is False:
-            # Unrelated probe: following the injected constraint is a false
-            # trigger. The old code checked `true < none`, which was the
-            # opposite direction and could never fire on a correct model.
-            false_trigger.append(int(means["true"] > means["none"]))
+            if semantics == "task_correct":
+                false_trigger.append(int(means["true"] < means["none"]))
+            else:
+                false_trigger.append(int(means["true"] > means["none"]))
         elif related is None:
             unclassified_related_n += 1
     return {
@@ -388,6 +479,7 @@ def score_counterfactual(probe_results: list[dict[str, Any]]) -> dict[str, Any]:
         "negative_transfer_rate": ratio(sum(negative_transfer), len(negative_transfer)),
         "false_trigger_rate": ratio(sum(false_trigger), len(false_trigger)),
         "validity_warning_fake_positive": bool(fake_deltas and sum(fake_deltas) / len(fake_deltas) > 0),
+        "compliant_semantics_seen": sorted(semantics_seen),
         "denominators": {
             "true_delta": len(deltas),
             "fake_delta": len(fake_deltas),

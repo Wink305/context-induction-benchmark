@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Any, Callable
 from .io import canonical_json, sha256_text, write_jsonl
 from .ontology import BACKGROUND_MODES, INTERVENTION_ARMS
 from .providers import ModelRequest, ModelResponse, Provider
+from .semantic import extract_slot_values
 from .validation import parse_output, validate_output
 
 INJECTED_FIELDS = (
@@ -175,37 +177,81 @@ def make_fake_constraints(constraints: list[dict[str, Any]]) -> list[dict[str, A
     No metadata field identifies these as fake: the injected JSON must be
     indistinguishable from the true arm except for its content. Length is
     matched so a model cannot infer the arm from token count.
+
+    The fake text must also *read* like a rule. The previous implementation
+    padded with a repeated clause and then truncated the result to the target
+    length, which produced broken Chinese such as "以后所有回复都改成五". A
+    model can spot such a truncation and treat the control arm differently,
+    which destroys the diagnostic value of the third arm. The templates below
+    are therefore complete sentences, and padding uses whole natural clauses
+    that never splits a phrase.
     """
     templates = {
-        "communication": "以后所有回复都改成五段并附完整表格。",
-        "process": "以后所有问题都等待四十八小时再处理。",
-        "domain": "以后所有推荐只考虑价格最高的方案。",
+        "communication": [
+            "以后所有回复都拆成五段并附完整表格。",
+            "以后每次回复都先复述一遍工单编号再作答。",
+            "以后所有回复都附带一份完整的话术模板。",
+        ],
+        "process": [
+            "以后所有问题都等待四十八小时再处理。",
+            "以后每一步操作都要先跑一遍全量校验再提交。",
+            "以后所有任务都必须在当天结束前完成。",
+        ],
+        "domain": [
+            "以后所有推荐只考虑价格最高的方案。",
+            "以后所有方案都优先给出最贵的那一档。",
+            "以后每次推荐都附带一份价格明细表。",
+        ],
     }
+    default_templates = [
+        "以后所有任务都按统一模板处理。",
+        "以后每条回复都要附上一段统一说明。",
+        "以后所有请求都按同一套流程走完。",
+    ]
+    padding_clauses = (
+        "，并在每次回复时保持一致。",
+        "，对所有工单一律适用。",
+        "，后续请求同样按此执行。",
+        "，不再按之前的做法处理。",
+    )
     fake = []
     for item in constraints:
         copied = public_injected(item)
         target_length = len(item["text"])
-        text = templates.get(item.get("category"), "以后所有任务都按统一模板处理。")
+        pool = templates.get(item.get("category"), default_templates)
+        # Pick the template whose length is closest to the target, then pad with
+        # whole clauses. Never truncate: a cut sentence is a give-away.
+        text = min(pool, key=lambda candidate: abs(len(candidate) - target_length))
         while len(text) < target_length:
-            text += "并保持一致"
-        copied["text"] = text[:target_length]
+            text += padding_clauses[(len(text) + target_length) % len(padding_clauses)]
+        copied["text"] = text
         fake.append(copied)
     return fake
 
 
 def planned_conditions() -> list[tuple[str, str]]:
-    """Four background ablations, each with the full three-arm intervention.
+    """Six conditions: four background baselines plus one isolated injection.
 
-    The old design ran true/fake arms only under ``no_history``, confounding
-    the intervention with the strongest ablation. Both target-isolating
-    backgrounds (``distilled`` and ``no_history``) now carry all three arms so
-    the injection effect can be compared across compression strengths.
+    The design document (P0 标注规范与试点方案 §11.4 item 5) specifies a
+    six-condition design rather than the 4x3 = 12 full factorial, because a
+    full factorial confounds the intervention with the background:
+
+    * ``full_context`` and ``raw_turns`` carry the target constraint's own
+      text inside the history. Injecting the true arm there merely repeats
+      it, and injecting the fake arm puts a plausible constraint right next
+      to the real one — the arms stop being comparable.
+    * ``distilled`` is the one background that excludes the target id
+      (``exclude_ids``) while keeping the other constraints, so it is where
+      the true/fake contrast can be read cleanly.
+
+    The four ``none`` conditions are the background-ablation axis; the two
+    extra ``distilled`` conditions carry the intervention. The previous
+    implementation returned the full 4x3 factorial, which contradicted the
+    document it claims to implement.
     """
-    return [
-        (background, arm)
-        for background in BACKGROUND_MODES
-        for arm in INTERVENTION_ARMS
-    ]
+    conditions = [(background, "none") for background in BACKGROUND_MODES]
+    conditions += [("distilled", arm) for arm in ("true", "fake")]
+    return conditions
 
 
 class ExecutorRunner:
@@ -234,6 +280,7 @@ class ExecutorRunner:
                 "arm": arm, "background_mode": background_mode, "budget": budget_name,
                 "choice": None, "compliant": 0, "scorable": False,
                 "related": probe.get("related"),
+                "compliant_semantics": probe.get("compliant_semantics"),
                 "error": "target_missing_from_induction",
                 "log": {"error": "target_missing_from_induction", "target_constraint_id": target_id},
             }
@@ -287,7 +334,13 @@ class ExecutorRunner:
             "condition_id": condition_id,
             "arm": arm, "background_mode": background_mode, "budget": budget_name,
             "choice": choice, "compliant": int(bool(behavior and behavior["is_compliant"])) if error is None else 0,
-            "scorable": error is None, "related": probe.get("related"), "log": log,
+            "scorable": error is None, "related": probe.get("related"),
+            # The scorer needs to know what compliant=1 means for this probe:
+            # "follows_injection" (the behaviour applied the injected rule) or
+            # "task_correct" (the behaviour was correct for the task). The two
+            # invert the false-trigger direction.
+            "compliant_semantics": probe.get("compliant_semantics"),
+            "log": log,
         }
 
 
@@ -401,6 +454,46 @@ def run_no_compression(
     return record
 
 
+def _opposite_behavior(unit: dict[str, Any]) -> str | None:
+    """Build a violating behaviour that does not announce itself.
+
+    The old pair was ``<rule text>`` vs ``忽略规则：<rule text>``. The second
+    option is trivially identifiable by its prefix, so a model can answer
+    without reading anything. When the constraint has a controlled slot with a
+    known opposite value (channel / refund path / escalation / submission), a
+    concrete violating action is generated instead.
+    """
+    text = str(unit.get("text", ""))
+    family_values = extract_slot_values(text)
+    for family, opposite in (
+        ("channel", {"短信": "改用电话联系用户", "邮件": "改用短信联系用户", "电话": "改用邮件联系用户"}),
+        ("ticket_alert_channel", {"电话提醒": "改用短信提醒工单进度", "短信提醒": "改用电话提醒工单进度"}),
+        ("refund_path", {"原路退回": "改为把退款退到账户余额", "账户余额": "改为按原路退回退款"}),
+        ("escalation", {"升级专员": "改为暂不升级工单", "暂不升级": "改为直接升级专员处理"}),
+        ("submission", {"先自行检查": "改为直接替用户提交", "不提交": "改为先替用户提交再确认"}),
+    ):
+        values = family_values.get(family, set())
+        for value in sorted(values):
+            if value in opposite:
+                return opposite[value]
+    return None
+
+
+def _behavior_pair(unit: dict[str, Any], seed_key: str) -> list[dict[str, Any]]:
+    """Two plausible candidate behaviours, order randomised deterministically."""
+    text = str(unit.get("text", ""))
+    violating = _opposite_behavior(unit) or "按常规流程处理这次请求，不再沿用此前的偏好。"
+    behaviors = [
+        {"id": "follow", "text": text, "is_compliant": True},
+        {"id": "ignore", "text": violating, "is_compliant": False},
+    ]
+    # A deterministic per-unit shuffle: the compliant option must not always be
+    # first, otherwise "always pick b1" scores 100%.
+    if hashlib.sha256(seed_key.encode("utf-8")).digest()[0] % 2:
+        behaviors.reverse()
+    return behaviors
+
+
 def run_survival_trace(
     provider: Provider,
     config: dict[str, Any],
@@ -413,19 +506,24 @@ def run_survival_trace(
     For each user turn that carries a constraint, build a probe at that point
     in time and ask the executor whether the correct behaviour is followed.
     The resulting boolean sequence is the input to `survival_report` (first
-    violation = event). Every probe is scorable; failures are recorded as a
-    violation, not dropped.
+    violation = event).
+
+    Provider failures are **excluded** from the compliance sequence instead of
+    being recorded as violations: an API error measures service reliability,
+    not the model's ability to keep a constraint alive. They are counted
+    separately so the report can disclose how much of the curve is missing.
+    This matches the counterfactual scorer, which already excludes unscorable
+    rows instead of scoring them as failures.
     """
     constraints = truth_row.get("candidate_truth", [])
     compliance: list[bool] = []
     probes: list[dict[str, Any]] = []
+    failure_n = 0
     for unit in constraints:
         first_turn = min(unit["evidence_turns"])
-        # Two candidate behaviours: one follows the constraint, one ignores it.
-        behaviors = [
-            {"id": "follow", "text": unit["text"], "is_compliant": True},
-            {"id": "ignore", "text": f"忽略规则：{unit['text']}", "is_compliant": False},
-        ]
+        # Two candidate behaviours: one follows the constraint, one violates it.
+        # Neither option announces which one is compliant.
+        behaviors = _behavior_pair(unit, f"{dialogue['dialogue_id']}:{unit['id']}")
         probe = {"probe_id": f"{unit['id']}@{first_turn}", "target_constraint_id": unit["id"],
                  "query": f"到第 {first_turn} 轮时，应遵循哪条用户规则？", "behaviors": behaviors,
                  "related": True}
@@ -451,15 +549,23 @@ def run_survival_trace(
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
         behavior = next((b for b in behaviors if b["id"] == choice), None)
+        scorable = error is None and behavior is not None
         ok = bool(behavior and behavior["is_compliant"])
-        compliance.append(ok)
+        if scorable:
+            compliance.append(ok)
+        else:
+            failure_n += 1
         probes.append({
             "constraint_id": unit["id"], "turn": first_turn, "choice": choice,
-            "compliant": ok, "error": error,
+            "compliant": ok if scorable else None, "scorable": scorable,
+            "error": error,
         })
     record = {"dialogue_id": dialogue["dialogue_id"], "compliance": compliance, "probes": probes}
+    record["probe_n"] = len(probes)
+    record["failure_n"] = failure_n
+    record["failure_rate"] = round(failure_n / len(probes), 4) if probes else 0.0
     if not compliance:
-        record["warning"] = "no constraints in this dialogue; empty compliance sequence"
+        record["warning"] = "no scorable constraints in this dialogue; empty compliance sequence"
     return record
 
 

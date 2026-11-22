@@ -36,23 +36,61 @@ class HarnessTests(unittest.TestCase):
         self.assertTrue(result["failure_counted"])
         self.assertEqual(len(result["attempts"]), 3)
 
-    def test_design_has_full_factorial_backgrounds_and_arms(self):
+    def test_design_is_the_six_condition_set_not_the_full_factorial(self):
+        """The document specifies six conditions; the code used to run 4x3 = 12.
+
+        A full factorial confounds the intervention with the background:
+        under ``full_context`` and ``raw_turns`` the target constraint's own
+        text is already in the history, so an injected arm cannot be compared
+        against anything.
+        """
         conditions = planned_conditions()
-        self.assertEqual(len(conditions), 12)
-        self.assertEqual({mode for mode, _ in conditions}, {"full_context", "distilled", "raw_turns", "no_history"})
+        self.assertEqual(len(conditions), 6)
+        self.assertEqual(
+            sorted(conditions),
+            sorted([
+                ("full_context", "none"), ("distilled", "none"),
+                ("raw_turns", "none"), ("no_history", "none"),
+                ("distilled", "true"), ("distilled", "fake"),
+            ]),
+        )
+
+    def test_every_background_keeps_a_none_baseline(self):
+        conditions = planned_conditions()
         for mode in ("full_context", "distilled", "raw_turns", "no_history"):
-            self.assertTrue(all((mode, arm) in conditions for arm in ("true", "none", "fake")))
+            self.assertIn((mode, "none"), conditions)
+
+    def test_the_intervention_only_runs_where_the_target_is_isolated(self):
+        conditions = planned_conditions()
+        for background, arm in conditions:
+            if arm in {"true", "fake"}:
+                self.assertEqual(
+                    background, "distilled",
+                    f"the {arm} arm leaked into {background}, where the target text is in the history",
+                )
 
     def test_fake_constraints_are_length_aligned_and_unlabeled(self):
         constraints = [public_constraint(item) for item in self.dialogue["candidate_truth"][:2]]
         fake = make_fake_constraints(constraints)
         for source, control in zip(constraints, fake):
-            self.assertEqual(len(source["text"]), len(control["text"]))
+            # Length-aligned without truncation: the control arm must be
+            # readable Chinese, otherwise the model can identify the arm by the
+            # broken sentence alone.
+            self.assertLessEqual(abs(len(source["text"]) - len(control["text"])), 24)
+            self.assertTrue(control["text"].endswith("。"))
             self.assertNotEqual(source["text"], control["text"])
             # No metadata field may reveal which arm a constraint came from.
             self.assertEqual(set(control), set(source))
             self.assertNotIn("fake_control", control)
             self.assertEqual(control["id"], source["id"])
+
+    def test_fake_constraint_text_is_never_cut_mid_phrase(self):
+        """The old implementation truncated to the target length ('以后所有回复都改成五')."""
+        constraints = [public_constraint(item) for item in self.dialogue["candidate_truth"][:4]]
+        for source, control in zip(constraints, make_fake_constraints(constraints)):
+            self.assertNotIn("改成五", control["text"])
+            self.assertNotIn("以后所有问题", control["text"][:6])
+            self.assertTrue(control["text"].endswith("。"))
 
     def test_injected_prompt_does_not_leak_arm_metadata(self):
         from context_benchmark.harness import public_injected

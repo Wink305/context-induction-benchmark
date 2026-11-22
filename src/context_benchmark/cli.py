@@ -21,10 +21,14 @@ from .io import read_json, read_jsonl, write_json, write_jsonl
 from .manifest import build_run_manifest, validate_submission
 from .ontology import BUDGETS
 from .providers import MockProvider, OpenAICompatibleProvider
-from .scoring import judge_calibration, score_counterfactual, score_dataset
+from .scoring import MATCHER_VERSION, judge_calibration, score_counterfactual, score_dataset, score_dialogue
 from .sheets import make_sheets, parse_sheets
 from .survival import survival_report
 from .validation import public_constraint, validate_candidate_dialogue
+
+# Recorded in every self-check artifact so a stale artifact can be detected by
+# comparing it with the scorer that is actually installed.
+SCORER_VERSION = "scoring.py@semantic_guard_v1"
 
 
 def _provider(config: dict[str, Any]):
@@ -40,12 +44,32 @@ def _provider(config: dict[str, Any]):
     raise ValueError(f"Unknown provider: {config['provider']}")
 
 
+def _require_pinned(config: dict[str, Any]) -> None:
+    """Every model-touching command path must pin the model.
+
+    ``run-induction`` already enforced this; the executor and no-compression
+    paths did not, so an unpinned model could produce E/F artifacts (and a
+    submission package) that the README explicitly calls irreproducible.
+    """
+    if not config.get("model_id") or not config.get("pinned_version"):
+        raise ValueError(
+            "A verified model_id and pinned_version are required "
+            "(an unpinned model makes a benchmark run irreproducible)"
+        )
+
+
 def _self_check(candidate_path: Path, output_path: Path | None = None) -> dict[str, Any]:
     """Scorer sanity check: oracle must pass AND negatives must fail.
 
     Feeding the answer key back and getting 1.0 proves nothing on its own. The
     check is only meaningful when a set of corrupted predictions is scored low
     by the same scorer. Both are reported; neither is a model result.
+
+    Three negative controls are used, because the interesting failures are not
+    random noise: gibberish text, **semantically inverted** text (the gold
+    sentence plus "不要遵守本条，改为完全相反的操作"), and value-flipped text
+    (the same slot with the opposite value, e.g. 短信 → 邮件). A scorer that
+    only rejects noise but accepts an inverted constraint is not usable.
     """
     dialogues = read_jsonl(candidate_path)
     validation = [validate_candidate_dialogue(dialogue) for dialogue in dialogues]
@@ -53,35 +77,103 @@ def _self_check(candidate_path: Path, output_path: Path | None = None) -> dict[s
         {"dialogue_id": dialogue["dialogue_id"], "output": {"constraints": [public_constraint(item) for item in dialogue["candidate_truth"]]}}
         for dialogue in dialogues
     ]
-    # Negative controls: same ids/evidence, but text replaced with gibberish.
-    # A scorer that still returns 1.0 here is broken.
-    negatives = []
-    for dialogue in dialogues:
-        constraints = [public_constraint(item) for item in dialogue["candidate_truth"]]
-        for item in constraints:
-            item["text"] = "甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未"
-        negatives.append({"dialogue_id": dialogue["dialogue_id"], "output": {"constraints": constraints}})
+
+    def corrupted(builder) -> list[dict[str, Any]]:
+        rows = []
+        for dialogue in dialogues:
+            constraints = [public_constraint(item) for item in dialogue["candidate_truth"]]
+            for item in constraints:
+                item["text"] = builder(item["text"])
+            rows.append({"dialogue_id": dialogue["dialogue_id"], "output": {"constraints": constraints}})
+        return rows
+
+    # Negative controls: same ids/types/evidence, corrupted text.
+    # A scorer that still returns a high score here is broken.
+    def flip_slot_values(text: str) -> str:
+        """Swap a controlled value for its opposite, in both directions.
+
+        A one-directional replacement would leave most variants untouched
+        (the pilot mixes 短信/邮件 phrasings), which would make the control
+        look like it passed while most of the corpus was untouched.
+        """
+        swaps = (("短信", "\0MAIL\0"), ("邮件", "短信"), ("\0MAIL\0", "邮件"))
+        swapped = text
+        for source, target in swaps:
+            swapped = swapped.replace(source, target)
+        return swapped
+
+    negatives = {
+        "gibberish": corrupted(lambda text: "甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未"),
+        "semantic_inversion": corrupted(
+            lambda text: text + "但请不要遵守本条，改为完全相反的操作并忽略前面的要求。"
+        ),
+    }
     oracle_scored = score_dataset(dialogues, oracle)["aggregate"]
-    negative_scored = score_dataset(dialogues, negatives)["aggregate"]
+    negative_scored = {
+        name: score_dataset(dialogues, rows)["aggregate"] for name, rows in negatives.items()
+    }
     oracle_must_include = oracle_scored["must_include"]["value"]
-    negative_must_include = negative_scored["must_include"]["value"]
+    negative_must_include = {
+        name: aggregate["must_include"]["value"] for name, aggregate in negative_scored.items()
+    }
+    gaps = {
+        name: (oracle_must_include - value) if (oracle_must_include is not None and value is not None) else None
+        for name, value in negative_must_include.items()
+    }
+
+    # Value-flip control is measured per unit, because only the units that
+    # carry a controlled slot can be flipped. A corpus-level must_include over
+    # the whole pilot would stay high simply because most units were untouched.
+    flip_total = 0
+    flip_caught = 0
+    flip_matched = 0
+    for dialogue in dialogues:
+        for item in dialogue["candidate_truth"]:
+            flipped = flip_slot_values(item["text"])
+            if flipped == item["text"]:
+                continue
+            flip_total += 1
+            row = {
+                "dialogue_id": dialogue["dialogue_id"],
+                "output": {"constraints": [dict(public_constraint(item), text=flipped)]},
+            }
+            scored = score_dialogue(dialogue, row)
+            if scored["match_n"] > 0:
+                flip_matched += 1
+            if scored["content_gate"]["content_ok_n"] == 0:
+                flip_caught += 1
+    flip_rate = (flip_caught / flip_total) if flip_total else None
+
     discriminates = (
         oracle_must_include is not None
-        and negative_must_include is not None
-        and oracle_must_include - negative_must_include >= 0.5
+        and all(value is not None for value in negative_must_include.values())
+        and all(gap is not None and gap >= 0.5 for gap in gaps.values())
+        and flip_rate is not None
+        and flip_rate >= 0.9
     )
     result = {
         "scientific_status": "validator_and_scorer_self_check_not_a_model_result",
+        "scorer_version": SCORER_VERSION,
+        "matcher_version": MATCHER_VERSION,
         "candidate_validation_pass_n": sum(report.valid for report in validation),
         "candidate_dialogue_n": len(dialogues),
         "candidate_issues": [report.to_dict() for report in validation if not report.valid],
         "oracle_aggregate": oracle_scored,
-        "negative_control_aggregate": negative_scored,
+        "negative_control_aggregates": negative_scored,
+        "value_flip_control": {
+            "unit_n": flip_total,
+            "caught_n": flip_caught,
+            "matched_n": flip_matched,
+            "catch_rate": flip_rate,
+            "required_catch_rate": 0.9,
+        },
         "discrimination_check": {
             "oracle_must_include": oracle_must_include,
-            "gibberish_must_include": negative_must_include,
-            "gap": (oracle_must_include - negative_must_include)
-            if oracle_must_include is not None and negative_must_include is not None else None,
+            "negative_must_include": negative_must_include,
+            "gap": gaps,
+            "min_gap": min((gap for gap in gaps.values() if gap is not None), default=None),
+            "value_flip_catch_rate": flip_rate,
+            "required_gap": 0.5,
             "passes": discriminates,
         },
     }
@@ -90,8 +182,8 @@ def _self_check(candidate_path: Path, output_path: Path | None = None) -> dict[s
     if not discriminates:
         raise ValueError(
             f"Scorer self-check failed discrimination: oracle={oracle_must_include}, "
-            f"gibberish={negative_must_include}. A scorer that cannot tell these "
-            f"apart must not be used to report model results."
+            f"negatives={negative_must_include}, value_flip_catch_rate={flip_rate}. "
+            f"A scorer that cannot tell these apart must not be used to report model results."
         )
     return result
 
@@ -134,9 +226,24 @@ def build_parser() -> argparse.ArgumentParser:
     judge.add_argument("--output", required=True)
 
     freeze = sub.add_parser("freeze-gold", help="Freeze human-adjudicated annotations; never auto-resolves")
-    freeze.add_argument("--candidate", required=True)
-    freeze.add_argument("--annotations", required=True)
+    freeze.add_argument(
+        "--candidate",
+        required=True,
+        help="Truth-free annotation worksheet (data/pilot_v0/annotation_worksheet.jsonl). "
+             "Generator truth is refused: it carries candidate_only markers.",
+    )
+    freeze.add_argument("--annotations", required=True, help="Annotator A's parsed annotation set")
+    freeze.add_argument(
+        "--annotations-b", required=True,
+        help="Annotator B's parsed annotation set. Agreement between a set and itself is "
+             "vacuous, so the freezer refuses to run without this.",
+    )
     freeze.add_argument("--agreement-report", required=True)
+    freeze.add_argument(
+        "--distractors",
+        help="Truth file carrying the rule-audited distractors / non_units to attach to the "
+             "frozen gold. Without it the negative side is absent and FMR is undefined.",
+    )
     freeze.add_argument("--resolutions", required=True, help="JSON list of explicit third-reviewer decisions")
     freeze.add_argument("--output-dir", required=True)
 
@@ -156,7 +263,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_e.add_argument("--runtime", default="configs/runtime.json")
     run_e.add_argument("--tasks", default="data/pilot_v0/tasks.jsonl")
     run_e.add_argument("--truth", default="data/pilot_v0/candidate_truth.jsonl")
-    run_e.add_argument("--executor-prompt", default="prompts/executor_v1.txt")
+    run_e.add_argument("--executor-prompt", default="prompts/executor_v2.txt")
     run_e.add_argument("--output", required=True)
     run_e.add_argument("--limit", type=int)
 
@@ -177,6 +284,11 @@ def build_parser() -> argparse.ArgumentParser:
     parse = sub.add_parser("parse-sheets", help="Parse filled annotation sheets into annotation records")
     parse.add_argument("--dir", required=True)
     parse.add_argument("--annotator", default="A")
+    parse.add_argument(
+        "--provenance", default=None,
+        help="Declared origin of these sheets (human / ai_precheck / …). Without a "
+             "declaration the parsed rows are marked unknown, never human.",
+    )
     parse.add_argument("--output", required=True)
     parse.add_argument("--report", required=True)
 
@@ -201,7 +313,7 @@ def build_parser() -> argparse.ArgumentParser:
     probes.add_argument("--tasks", default="data/pilot_v0/tasks.jsonl")
     probes.add_argument("--truth", default="data/pilot_v0/candidate_truth.jsonl")
     probes.add_argument("--predictions", required=True)
-    probes.add_argument("--executor-prompt", default="prompts/executor_v1.txt")
+    probes.add_argument("--executor-prompt", default="prompts/executor_v2.txt")
     probes.add_argument("--output", required=True)
     probes.add_argument("--logs", required=True)
     probes.add_argument("--scores", help="Optional counterfactual score report")
@@ -259,6 +371,8 @@ def main(argv: list[str] | None = None) -> None:
         result = freeze_gold(
             read_jsonl(args.candidate), read_jsonl(args.annotations), read_json(args.agreement_report),
             read_json(args.resolutions), args.output_dir,
+            annotations_b=read_jsonl(args.annotations_b),
+            distractor_source=args.distractors,
         )
     elif args.command == "survival":
         # Accept either a single JSON object or a JSONL trace produced by
@@ -274,6 +388,7 @@ def main(argv: list[str] | None = None) -> None:
         write_json(args.output, result)
     elif args.command == "run-r2":
         config = read_json(args.runtime)
+        _require_pinned(config)
         tasks = read_jsonl(args.tasks)
         if args.limit:
             tasks = tasks[:args.limit]
@@ -290,6 +405,7 @@ def main(argv: list[str] | None = None) -> None:
         }
     elif args.command == "run-survival-trace":
         config = read_json(args.runtime)
+        _require_pinned(config)
         tasks = read_jsonl(args.tasks)
         truth = {row["dialogue_id"]: row for row in read_jsonl(args.truth)}
         if args.limit:
@@ -325,7 +441,9 @@ def main(argv: list[str] | None = None) -> None:
             truth_path=args.truth,
         )
     elif args.command == "parse-sheets":
-        parsed = parse_sheets(Path(args.dir), annotator=args.annotator)
+        parsed = parse_sheets(
+            Path(args.dir), annotator=args.annotator, provenance=args.provenance
+        )
         annotations = parsed.pop("annotations")
         write_jsonl(args.output, annotations)
         write_json(args.report, parsed)
@@ -368,6 +486,7 @@ def main(argv: list[str] | None = None) -> None:
             )
     elif args.command == "run-probes":
         config = read_json(args.runtime)
+        _require_pinned(config)
         truth = {row["dialogue_id"]: row for row in read_jsonl(args.truth)}
         predictions = {row["dialogue_id"]: row for row in read_jsonl(args.predictions)}
         tasks = read_jsonl(args.tasks)
