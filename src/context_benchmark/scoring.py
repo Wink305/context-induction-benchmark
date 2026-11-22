@@ -6,7 +6,9 @@ validated semantic judge. P0 must calibrate or replace it before any model claim
 
 from __future__ import annotations
 
+import json
 from collections import Counter, defaultdict
+from pathlib import Path
 from typing import Any, Iterable
 
 from .ontology import ACTIVE_TYPES, TYPE_TO_CODE
@@ -21,10 +23,57 @@ MATCHER_VERSION = "evidence_char_ngram_greedy_v3_text_gated_semantic_guard"
 # these thresholds must not be described as "calibrated on human prechecks".
 # P1 must fit them on an independent, human-labelled calibration set and report
 # sensitivity before any model score is reported. See design doc §5 and §11.2.
-TEXT_MATCH_MIN = 0.10
+TEXT_MATCH_MIN_DEFAULT = 0.10
 # The predicted text must also be recoverable from the user turns it cites.
 # Coverage = |bigrams(text) ∩ bigrams(cited turns)| / |bigrams(text)|.
-ANCHOR_COVERAGE_MIN = 0.08
+ANCHOR_COVERAGE_MIN_DEFAULT = 0.08
+
+
+def _load_thresholds() -> tuple[float, float, dict[str, Any]]:
+    """Return the effective gates and where they came from.
+
+    A calibration nobody reads is a decoration. When
+    ``configs/calibration.json`` exists and declares ``state: "calibrated"``,
+    its numbers are the ones in force; otherwise the built-in defaults are.
+    The file is read once at import time and the result is reported in every
+    score so a score can never be read without knowing which thresholds
+    produced it.
+    """
+    path = Path(__file__).resolve().parents[2] / "configs" / "calibration.json"
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return (
+            TEXT_MATCH_MIN_DEFAULT,
+            ANCHOR_COVERAGE_MIN_DEFAULT,
+            {"state": "unavailable", "source": "built_in_default"},
+        )
+    state = config.get("state", "uncalibrated")
+    if state != "calibrated":
+        return (
+            TEXT_MATCH_MIN_DEFAULT,
+            ANCHOR_COVERAGE_MIN_DEFAULT,
+            {"state": state, "source": "built_in_default"},
+        )
+    thresholds = config.get("thresholds") or {}
+    try:
+        text_min = float(thresholds["text_min"])
+        anchor_min = float(thresholds["anchor_coverage_min"])
+    except (KeyError, TypeError, ValueError):
+        return (
+            TEXT_MATCH_MIN_DEFAULT,
+            ANCHOR_COVERAGE_MIN_DEFAULT,
+            {"state": state, "source": "built_in_default",
+             "warning": "the calibration config declares 'calibrated' but has no usable thresholds"},
+        )
+    return (
+        text_min,
+        anchor_min,
+        {"state": state, "source": "configs/calibration.json"},
+    )
+
+
+TEXT_MATCH_MIN, ANCHOR_COVERAGE_MIN, THRESHOLD_SOURCE = _load_thresholds()
 CONTENT_TEXT_MIN = TEXT_MATCH_MIN
 
 
@@ -75,18 +124,28 @@ def unit_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:
 def greedy_match(
     gold: list[dict[str, Any]], predictions: list[dict[str, Any]], threshold: float = 0.32,
     *, turns: dict[int, dict[str, Any]] | None = None,
+    text_min: float | None = None, anchor_min: float | None = None,
 ) -> tuple[list[tuple[int, int, float]], list[int], list[int]]:
+    """Match predictions against gold units.
+
+    ``text_min`` and ``anchor_min`` default to the module-level gates and are
+    overridable so that ``scripts/fit_thresholds.py`` can evaluate a grid of
+    thresholds without mutating the process-wide constants. The default
+    behaviour is unchanged.
+    """
+    effective_text_min = TEXT_MATCH_MIN if text_min is None else text_min
+    effective_anchor_min = ANCHOR_COVERAGE_MIN if anchor_min is None else anchor_min
     candidates = []
     for gi, gold_item in enumerate(gold):
         for pi, prediction in enumerate(predictions):
             text_sim = _dice(_ngrams(gold_item.get("text", "")), _ngrams(prediction.get("text", "")))
             # Hard text gate: a perfect evidence overlap must not be enough to
             # match a prediction whose text has nothing to do with the gold.
-            if text_sim < TEXT_MATCH_MIN:
+            if text_sim < effective_text_min:
                 continue
             if turns is not None and anchor_coverage(
                 prediction.get("text", ""), turns, prediction.get("evidence_turns", [])
-            ) < ANCHOR_COVERAGE_MIN:
+            ) < effective_anchor_min:
                 continue
             score = unit_similarity(gold_item, prediction)
             if score >= threshold:
@@ -304,6 +363,12 @@ def score_dataset(dialogues: list[dict[str, Any]], prediction_rows: list[dict[st
         "metric_version": "a-c-v1-text-gated",
         "matcher_version": MATCHER_VERSION,
         "matcher_calibrated": False,
+        "scoring_thresholds": {
+            "text_min": TEXT_MATCH_MIN,
+            "anchor_coverage_min": ANCHOR_COVERAGE_MIN,
+            "source": THRESHOLD_SOURCE.get("source"),
+            "calibration_state": THRESHOLD_SOURCE.get("state"),
+        },
         "scientific_status": "engineering_baseline_not_a_model_result",
         "per_dialogue": rows,
         "aggregate": aggregate,
