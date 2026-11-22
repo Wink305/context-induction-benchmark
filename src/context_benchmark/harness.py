@@ -230,18 +230,28 @@ def make_fake_constraints(constraints: list[dict[str, Any]]) -> list[dict[str, A
 
 
 def planned_conditions() -> list[tuple[str, str]]:
-    """Four background ablations, each with the full three-arm intervention.
+    """Six conditions: four background baselines plus one isolated injection.
 
-    The old design ran true/fake arms only under ``no_history``, confounding
-    the intervention with the strongest ablation. Both target-isolating
-    backgrounds (``distilled`` and ``no_history``) now carry all three arms so
-    the injection effect can be compared across compression strengths.
+    The design document (P0 标注规范与试点方案 §11.4 item 5) specifies a
+    six-condition design rather than the 4x3 = 12 full factorial, because a
+    full factorial confounds the intervention with the background:
+
+    * ``full_context`` and ``raw_turns`` carry the target constraint's own
+      text inside the history. Injecting the true arm there merely repeats
+      it, and injecting the fake arm puts a plausible constraint right next
+      to the real one — the arms stop being comparable.
+    * ``distilled`` is the one background that excludes the target id
+      (``exclude_ids``) while keeping the other constraints, so it is where
+      the true/fake contrast can be read cleanly.
+
+    The four ``none`` conditions are the background-ablation axis; the two
+    extra ``distilled`` conditions carry the intervention. The previous
+    implementation returned the full 4x3 factorial, which contradicted the
+    document it claims to implement.
     """
-    return [
-        (background, arm)
-        for background in BACKGROUND_MODES
-        for arm in INTERVENTION_ARMS
-    ]
+    conditions = [(background, "none") for background in BACKGROUND_MODES]
+    conditions += [("distilled", arm) for arm in ("true", "fake")]
+    return conditions
 
 
 class ExecutorRunner:

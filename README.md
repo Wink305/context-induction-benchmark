@@ -40,9 +40,10 @@ Honesty about the gap between this repository and the design document is a proje
 | Deterministic generator, rule audit, coverage report | **implemented** (`generator.py`, `audit.py`) |
 | Dual-list FAMA with explicit numerators/denominators | **implemented** (`scoring.py`), but the text gate is an **uncalibrated heuristic** |
 | Semantic conflict detection (opposite value / ignore-this-rule) | **implemented as a rule-based guard** (`semantic.py`), uncalibrated, no embedding model |
-| Four background ablations x three intervention arms | **implemented in the harness**; never executed against a real model |
+| Four background ablations with an isolated three-arm intervention (six conditions) | **implemented in the harness**; never executed against a real model |
 | Kaplan-Meier survival curve (E), no-compression guard (F) | **implemented**; E now excludes provider failures from the curve instead of scoring them as violations |
 | Judge protocol (three heterogeneous judges, two-class calibration) | **scorer side only** (`judge_calibration`); no judge is wired to a provider yet |
+| Scorer thresholds fitted on a human-labelled calibration set | **not implemented**; `configs/calibration.json` is still `uncalibrated` and the two gates in `scoring.py` are still hand-picked. The fitting tool exists and refuses to write a calibrated config without a third-party adjudicator |
 | Eleven-step generation pipeline, BM25+MPNet semantic-disconnect filter | **not implemented**; the shipped filter is a character-bigram approximation and says so in the config |
 | Human annotation, kappa, adjudication, gold freeze | **partial**; the machinery is implemented and the chain is exercised end to end, but no human has filled a sheet yet: no κ has been measured and no gold has been frozen |
 | Annotation chain: answer-free sheets, boundary tags, kappa-only gate, adjudication, provenance-checked gold freeze | **implemented** (`sheets.py`, `agreement.py`, `adjudication.py`, `provenance.py`); the freeze refuses generator or AI provenance, and one annotator cannot certify agreement |
@@ -260,7 +261,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: fork, branch, run the
 
 The most useful contribution right now is **not code**:
 
-- **Human annotation of the calibration set.** 5 dialogues, ~60 units, 40–60 minutes. This is the single biggest gap: without it there is no κ and no human gold.
+- **Human annotation of the calibration set.** 5 dialogues, 48 units, 40–60 minutes. This is the single biggest gap: without it there is no κ and no human gold.
 - **Independent reproduction** of the audit result on your machine.
 - **Criticism of the ontology.** If R1–R8 rules are ambiguous to you, that is a finding, not a nuisance — open an issue.
 
