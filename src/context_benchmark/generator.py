@@ -1328,11 +1328,13 @@ def _build_standard_randomized(
     if kind == "distractor":
         distractors.append({
             "id": "d001", "text": "默认使用短信提醒所有工单", "evidence_turns": [turn_of["c005"][0] + 1],
-            "category": "communication", "expected": "exclude", "note": "客服单方声明，用户未确认，不得抽为用户约束",
+            "category": "communication", "expected": "exclude", "error_kind": "agent_claim",
+            "note": "客服单方声明，用户未确认，不得抽为用户约束",
         })
         distractors.append({
             "id": "d002", "text": "默认向所有用户推荐最贵的方案", "evidence_turns": [turn_of["c012"][0] + 1],
-            "category": "domain", "expected": "exclude", "note": "客服单方声明，用户未确认，不得抽为用户约束",
+            "category": "domain", "expected": "exclude", "error_kind": "agent_claim",
+            "note": "客服单方声明，用户未确认，不得抽为用户约束",
         })
 
     axes = {
@@ -1418,6 +1420,64 @@ def _build_empty_randomized(
     }
 
 
+def _depth_bucket_of(turn: int, total_turns: int) -> str:
+    """Where in the dialogue a turn sits, on the same scale the scorer uses."""
+    if total_turns <= 0:
+        return "early"
+    position = turn / total_turns
+    if position < 1 / 3:
+        return "early"
+    if position < 2 / 3:
+        return "mid"
+    return "late"
+
+
+def _v1_traps(dialogue: dict[str, Any]) -> list[dict[str, Any]]:
+    """Label the traps this dialogue already contains.
+
+    The generated dialogue already plants several kinds of trap — a rule the
+    user withdraws, a rule the user replaces, a one-off request worded like a
+    standing rule, and the agent's own claims that were never the user's.
+    What was missing was the label saying so; without it the trap axis had
+    nothing to score against.
+
+    Only the R1 one-off is labelled per dialogue: the one whose boundary rule
+    is "rule-like wording, bound to this task". The other one-off requests
+    are plainly bound to their task, and labelling them as traps would
+    measure the annotator's patience rather than the model's judgement.
+    """
+    traps: list[dict[str, Any]] = []
+    turns = dialogue.get("turns", [])
+    total = len(turns)
+
+    def _add(kind: str, target_turns: list[int], affected: list[str], disposition: str) -> None:
+        if not target_turns:
+            return
+        traps.append({
+            "trap_id": f"t{len(traps) + 1:02d}",
+            "kind": kind,
+            "target_turns": list(target_turns),
+            "affected_constraint_ids": list(affected),
+            "expected_disposition": disposition,
+            "depth_bucket": _depth_bucket_of(max(target_turns), total),
+        })
+
+    for item in dialogue.get("candidate_truth", []):
+        if item.get("type") == "superseded":
+            evidence = item.get("evidence_turns") or []
+            if not evidence:
+                continue
+            kind = "replaced" if item.get("superseded_by") else "withdrawn"
+            _add(kind, [max(evidence)], [item["id"]], "drop")
+        elif item.get("type") == "one_off" and "R1" in (item.get("rule_tags") or []):
+            _add("one_off_disguise", item.get("evidence_turns") or [], [item["id"]], "keep_as_one_off")
+
+    for distractor in dialogue.get("distractors", []):
+        _add("non_user_claim", distractor.get("evidence_turns") or [], [distractor["id"]], "not_a_constraint")
+
+    return traps
+
+
 def _generate_randomized(config: dict[str, Any]) -> tuple[list[dict[str, Any]], list[int]]:
     """Generate the whole randomised data set.
 
@@ -1467,6 +1527,7 @@ def _generate_randomized(config: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             index, scenario_by_index[index], kind, structure_by_index[index], rng, surface_plan[index], config
         )
         dialogue["probes"] = _v1_probes(dialogue, rng, config, surface_plan[index])
+        dialogue["traps"] = _v1_traps(dialogue)
         dialogues[index] = dialogue
     for index in sorted(empty_ids):
         rng = random.Random(f"{config['seed']}|{index}")
@@ -1486,6 +1547,9 @@ def coverage_report(dialogues: list[dict[str, Any]], config: dict[str, Any]) -> 
     categories = Counter()
     rules: dict[str, set[str]] = defaultdict(set)
     structures = Counter()
+    trap_kinds = Counter()
+    trap_depths = Counter()
+    trap_n = 0
     turn_counts = []
     for dialogue in dialogues:
         turn_counts.append(len(dialogue["turns"]))
@@ -1498,10 +1562,17 @@ def coverage_report(dialogues: list[dict[str, Any]], config: dict[str, Any]) -> 
         for item in dialogue["non_units"] + dialogue["distractors"]:
             for rule in item.get("rule_tags", []):
                 rules[rule].add(dialogue["dialogue_id"])
+        for trap in dialogue.get("traps", []) or []:
+            trap_kinds[trap["kind"]] += 1
+            trap_depths[trap.get("depth_bucket", "early")] += 1
+            trap_n += 1
     unit_count = sum(types.values())
     empty_count = sum(d["dialogue_kind"] == "empty" for d in dialogues)
     distractor_dialogues = sum(bool(d["distractors"]) for d in dialogues)
     rule_counts = {rule: len(rules.get(rule, set())) for rule in RULES}
+    expect_traps = bool(config.get("expect_traps"))
+    expected_trap_kinds = tuple(config.get("expected_trap_kinds", ()))
+    min_traps_per_kind = int(config.get("min_traps_per_kind", 1))
     checks = {
         "dialogue_count_40": len(dialogues) == config["dialogue_count"],
         "turn_bounds": bool(turn_counts) and min(turn_counts) >= config["min_turns"] and max(turn_counts) <= config["max_turns"],
@@ -1511,6 +1582,14 @@ def coverage_report(dialogues: list[dict[str, Any]], config: dict[str, Any]) -> 
         "empty_min_coverage": empty_count >= config["min_empty_dialogues"],
         "distractor_min_coverage": distractor_dialogues >= config["min_distractor_dialogues"],
         "all_status_unannotated": all(d["status"] == DATASET_STATUS for d in dialogues),
+        # Trap checks only apply to a data set that claims to carry traps.
+        # The frozen pilot has none and says so; it is not failed for it.
+        "traps_present": (trap_n > 0) if expect_traps else True,
+        "trap_kinds_min_coverage": (
+            all(trap_kinds.get(kind, 0) >= min_traps_per_kind for kind in expected_trap_kinds)
+            if expect_traps else True
+        ),
+        "trap_depth_spread": (len(trap_depths) >= 3) if expect_traps else True,
     }
     return {
         "dataset_version": config["dataset_version"],
@@ -1525,6 +1604,20 @@ def coverage_report(dialogues: list[dict[str, Any]], config: dict[str, Any]) -> 
         "turns": {"min": min(turn_counts), "max": max(turn_counts), "mean": sum(turn_counts) / len(turn_counts)},
         "distractors": sum(len(d["distractors"]) for d in dialogues),
         "probes": sum(len(d["probes"]) for d in dialogues),
+        "traps": {
+            "total": trap_n,
+            "by_kind": dict(trap_kinds),
+            "by_depth": dict(trap_depths),
+            "expected_kinds": list(expected_trap_kinds),
+            "min_per_kind": min_traps_per_kind,
+            "note": (
+                "The frozen pilot carries no trap gold on purpose — it is a published "
+                "baseline and its hash does not move. The randomised extension set is "
+                "where the trap labels live."
+                if not expect_traps
+                else "Traps are labelled from material the dialogue already contains."
+            ),
+        },
         "checks": checks,
         "accepted_for_annotation_start": all(checks.values()),
         "not_a_gold_acceptance": True,

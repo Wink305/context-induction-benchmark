@@ -20,5 +20,13 @@
   "max_probe_bigram_overlap": 0.25,
   "semantic_filter_backend": "char_bigram_dice_overlap_only",
   "semantic_filter_note": "Character-bigram (Dice) overlap only. No embedding model and no BM25 ranking are used in this build; the cue-trigger semantic disconnect of the design document is approximated lexically and must not be reported as a semantic filter.",
-  "unrelated_probe_compliant_semantics": "follows_injection"
+  "unrelated_probe_compliant_semantics": "follows_injection",
+  "expect_traps": true,
+  "expected_trap_kinds": [
+    "withdrawn",
+    "replaced",
+    "one_off_disguise",
+    "non_user_claim"
+  ],
+  "min_traps_per_kind": 5
 }

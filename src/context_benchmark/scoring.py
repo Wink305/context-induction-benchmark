@@ -868,6 +868,11 @@ def score_traps(
     turn_map = {turn["turn"]: turn for turn in turns_list}
     gold = dialogue.get("candidate_truth", []) or []
     output = _prediction_output(prediction_row)
+    # The field being *absent* and the field being *empty* are different
+    # facts: absent means the prediction predates the contract (nothing can
+    # be concluded), empty means the model looked and found nothing (zero
+    # recall). Only the first is "not evaluated".
+    has_flag_field = isinstance(output.get("trap_flags"), list)
     flags = output.get("trap_flags") or []
 
     base: dict[str, Any] = {
@@ -888,10 +893,10 @@ def score_traps(
             "missed_and_followed_n": 0,
         })
         return base
-    if not flags:
+    if not has_flag_field:
         base.update({
             "not_evaluated": True,
-            "not_evaluated_reason": "the prediction carries no trap_flags",
+            "not_evaluated_reason": "the prediction carries no trap_flags field",
             "trap_flag_recall": None,
             "trap_flag_precision": None,
             "trap_disposition_accuracy": None,
@@ -907,6 +912,51 @@ def score_traps(
         if item is None:
             return False
         return _retained_as_active(item, predictions_for_disposition, turn_map, gates)
+
+    def _constraint_kept_as_non_active(constraint_id: str) -> bool:
+        """The constraint survived, but it was not treated as a durable rule."""
+        item = next((entry for entry in gold if entry.get("id") == constraint_id), None)
+        if item is None:
+            return False
+        for _gi, pi, _score in _capability_match([item], predictions_for_disposition, turn_map, gates):
+            prediction = predictions_for_disposition[pi]
+            verdict = _content_verdict(item, prediction, turn_map, gates)
+            if verdict["content_ok"] and prediction.get("type") not in ACTIVE_TYPES:
+                return True
+        return False
+
+    def _distractor_present(distractor_id: str) -> bool:
+        """Did a planted non-constraint make it into the constraint list?"""
+        item = next(
+            (entry for entry in (dialogue.get("distractors") or []) if entry.get("id") == distractor_id),
+            None,
+        )
+        if item is None:
+            return False
+        for _gi, pi, _score in _capability_match([item], predictions_for_disposition, turn_map, gates):
+            verdict = _content_verdict(item, predictions_for_disposition[pi], turn_map, gates)
+            if verdict["content_ok"]:
+                return True
+        return False
+
+    def _handled(trap: dict[str, Any]) -> bool:
+        disposition = trap.get("expected_disposition")
+        affected = trap.get("affected_constraint_ids") or []
+        if disposition == "retain_original":
+            return bool(affected) and all(_constraint_retained(cid) for cid in affected)
+        if disposition == "drop":
+            return bool(affected) and all(not _constraint_retained(cid) for cid in affected)
+        if disposition == "keep_as_one_off":
+            return bool(affected) and all(_constraint_kept_as_non_active(cid) for cid in affected)
+        if disposition == "not_a_constraint":
+            return bool(affected) and all(not _distractor_present(cid) for cid in affected)
+        if disposition == "mark_conflict":
+            return any(
+                flag.get("kind") == "conflicting_values"
+                and flag.get("constraint_ref") in affected
+                for flag in flags
+            )
+        return False
 
     matched_gold: dict[int, int] = {}
     true_positive_flags: set[int] = set()
@@ -927,19 +977,7 @@ def score_traps(
     disposition_ok_n = 0
     missed_and_followed_n = 0
     for gi, trap in enumerate(gold_traps):
-        affected = trap.get("affected_constraint_ids") or []
-        disposition = trap.get("expected_disposition")
-        handled = False
-        if disposition == "retain_original":
-            handled = bool(affected) and all(_constraint_retained(cid) for cid in affected)
-        elif disposition == "drop":
-            handled = all(not _constraint_retained(cid) for cid in affected)
-        elif disposition == "mark_conflict":
-            handled = any(
-                flag.get("kind") == "conflicting_values"
-                and flag.get("constraint_ref") in affected
-                for flag in flags
-            )
+        handled = _handled(trap)
         if gi in matched_gold:
             if handled:
                 disposition_ok_n += 1

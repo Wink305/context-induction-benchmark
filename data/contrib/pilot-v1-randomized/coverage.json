@@ -42,6 +42,28 @@
   },
   "distractors": 10,
   "probes": 105,
+  "traps": {
+    "total": 106,
+    "by_kind": {
+      "one_off_disguise": 35,
+      "withdrawn": 34,
+      "replaced": 27,
+      "non_user_claim": 10
+    },
+    "by_depth": {
+      "late": 47,
+      "mid": 28,
+      "early": 31
+    },
+    "expected_kinds": [
+      "withdrawn",
+      "replaced",
+      "one_off_disguise",
+      "non_user_claim"
+    ],
+    "min_per_kind": 5,
+    "note": "Traps are labelled from material the dialogue already contains."
+  },
   "checks": {
     "dialogue_count_40": true,
     "turn_bounds": true,
@@ -50,7 +72,10 @@
     "rules_min_coverage": true,
     "empty_min_coverage": true,
     "distractor_min_coverage": true,
-    "all_status_unannotated": true
+    "all_status_unannotated": true,
+    "traps_present": true,
+    "trap_kinds_min_coverage": true,
+    "trap_depth_spread": true
   },
   "accepted_for_annotation_start": true,
   "not_a_gold_acceptance": true

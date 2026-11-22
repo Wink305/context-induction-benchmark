@@ -42,6 +42,14 @@
   },
   "distractors": 10,
   "probes": 70,
+  "traps": {
+    "total": 0,
+    "by_kind": {},
+    "by_depth": {},
+    "expected_kinds": [],
+    "min_per_kind": 1,
+    "note": "The frozen pilot carries no trap gold on purpose — it is a published baseline and its hash does not move. The randomised extension set is where the trap labels live."
+  },
   "checks": {
     "dialogue_count_40": true,
     "turn_bounds": true,
@@ -50,7 +58,10 @@
     "rules_min_coverage": true,
     "empty_min_coverage": true,
     "distractor_min_coverage": true,
-    "all_status_unannotated": true
+    "all_status_unannotated": true,
+    "traps_present": true,
+    "trap_kinds_min_coverage": true,
+    "trap_depth_spread": true
   },
   "accepted_for_annotation_start": true,
   "not_a_gold_acceptance": true

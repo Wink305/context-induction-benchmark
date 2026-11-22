@@ -120,9 +120,18 @@ def validate_trap_flags(
                     issues.append(Issue(
                         "semantic_trap_turn_missing", f"turn {turn} does not exist", path
                     ))
-                elif turn_map[turn]["speaker"] != "user":
+                elif (
+                    turn_map[turn]["speaker"] != "user"
+                    and kind != "non_user_claim"
+                ):
+                    # A trap usually sits in a user turn, but the agent's own
+                    # claims are the classic non_user_claim trap and they sit
+                    # in an agent turn. Any other kind pointing at an agent
+                    # turn is a flag the model cannot justify.
                     issues.append(Issue(
-                        "semantic_trap_turn_not_user", f"turn {turn} is not user-side", path
+                        "semantic_trap_agent_turn_kind",
+                        f"turn {turn} is not user-side; only a non_user_claim trap may point at one",
+                        path,
                     ))
         reason = flag.get("reason")
         if not isinstance(reason, str) or not reason.strip():

@@ -71,11 +71,18 @@ class ContractTests(unittest.TestCase):
         report = validate_output(output, self.turns)
         self.assertIn("semantic_trap_turn_missing", {issue.code for issue in report.trap_issues})
 
-    def test_an_agent_turn_is_not_a_trap_site(self):
+    def test_an_agent_turn_is_only_allowed_for_a_non_user_claim(self):
+        """The agent's own claim is the classic trap on the other side."""
         agent_turn = next(turn["turn"] for turn in self.turns if turn["speaker"] == "agent")
-        output = {"constraints": self.constraints(), "trap_flags": [_flag(turns=(agent_turn,))]}
-        report = validate_output(output, self.turns)
-        self.assertIn("semantic_trap_turn_not_user", {issue.code for issue in report.trap_issues})
+        allowed = {"constraints": self.constraints(), "trap_flags": [
+            _flag(kind="non_user_claim", turns=(agent_turn,), reason="客服单方声明")
+        ]}
+        self.assertEqual(validate_output(allowed, self.turns).trap_error_n, 0)
+        wrong = {"constraints": self.constraints(), "trap_flags": [
+            _flag(kind="withdrawn", turns=(agent_turn,))
+        ]}
+        codes = {issue.code for issue in validate_output(wrong, self.turns).trap_issues}
+        self.assertIn("semantic_trap_agent_turn_kind", codes)
 
     def test_an_empty_reason_is_rejected(self):
         output = {"constraints": self.constraints(), "trap_flags": [_flag(reason="  ")]}
@@ -322,6 +329,73 @@ class SchemaConsistencyTests(unittest.TestCase):
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
         self.assertNotIn("trap_flags", schema["required"])
         self.assertIn("trap_flags", schema["properties"])
+
+
+class TrapDataTests(unittest.TestCase):
+    """The extension set must actually carry traps, or the trap axis is empty.
+
+    The frozen pilot has none on purpose — it is a baseline and changing it
+    would move a published hash. The randomised extension set is where new
+    material goes, so the traps live there.
+    """
+
+    PATH = "data/contrib/pilot-v1-randomized/candidate_truth.jsonl"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.rows = read_jsonl(cls.PATH)
+
+    def test_every_non_empty_dialogue_carries_traps(self):
+        non_empty = [row for row in self.rows if row.get("candidate_truth")]
+        self.assertTrue(non_empty)
+        for row in non_empty:
+            self.assertTrue(row.get("traps"), f"{row['dialogue_id']} carries no traps")
+
+    def test_all_four_labelled_kinds_are_covered(self):
+        kinds = {trap["kind"] for row in self.rows for trap in row.get("traps", [])}
+        self.assertEqual(
+            kinds,
+            {"withdrawn", "replaced", "one_off_disguise", "non_user_claim"},
+        )
+
+    def test_traps_are_spread_across_the_dialogue(self):
+        depths = {trap["depth_bucket"] for row in self.rows for trap in row.get("traps", [])}
+        self.assertEqual(depths, {"early", "mid", "late"})
+
+    def test_trap_turns_exist_in_the_dialogue(self):
+        for row in self.rows:
+            turns = {turn["turn"] for turn in row["turns"]}
+            for trap in row.get("traps", []):
+                for turn in trap["target_turns"]:
+                    self.assertIn(turn, turns, f"{row['dialogue_id']} trap points at turn {turn}")
+
+    def test_a_perfect_prediction_scores_perfectly_on_the_trap_axis(self):
+        row = next(item for item in self.rows if item.get("traps") and item.get("candidate_truth"))
+        constraints = [public_constraint(item) for item in row["candidate_truth"]]
+        flags = [
+            {
+                "kind": trap["kind"],
+                "target_turns": trap["target_turns"],
+                "reason": f"{trap['kind']} at turn {max(trap['target_turns'])}",
+                "constraint_ref": (trap["affected_constraint_ids"] or [None])[0],
+            }
+            for trap in row["traps"]
+        ]
+        prediction = {"dialogue_id": row["dialogue_id"], "output": {"constraints": constraints, "trap_flags": flags}}
+        result = score_traps(row, prediction)
+        self.assertFalse(result["not_evaluated"])
+        self.assertEqual(result["trap_flag_recall"]["value"], 1.0)
+        self.assertEqual(result["trap_flag_precision"]["value"], 1.0)
+        self.assertEqual(result["trap_disposition_accuracy"]["value"], 1.0)
+        self.assertEqual(result["missed_and_followed_n"], 0)
+
+    def test_saying_nothing_about_the_traps_scores_zero_recall_not_not_evaluated(self):
+        row = next(item for item in self.rows if item.get("traps") and item.get("candidate_truth"))
+        constraints = [public_constraint(item) for item in row["candidate_truth"]]
+        prediction = {"dialogue_id": row["dialogue_id"], "output": {"constraints": constraints, "trap_flags": []}}
+        result = score_traps(row, prediction)
+        self.assertFalse(result["not_evaluated"], "the gold has traps, so this must be scored")
+        self.assertEqual(result["trap_flag_recall"]["value"], 0.0)
 
 
 class AggregateTests(unittest.TestCase):
