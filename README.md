@@ -17,6 +17,14 @@ A diagnostic benchmark for measuring whether a language model can **decide what 
 
 Existing memory benchmarks evaluate whether a system can **store and retrieve**. This one evaluates the upstream step: whether a model can **tell what deserves to be stored at all**.
 
+The scorer has two layers. The A/C layer asks one question: does this prediction look like the gold constraint? The **capability layer** (`score_capabilities`) asks three different ones, each with its own denominator and its own failure mode:
+
+- **retention** — were the durable constraints kept *whole*, and were the ones at the end of a long dialogue kept as well as the ones at the start (`full_set_exact`, `retention_by_depth`, `evidence_iou_mean`);
+- **pruning** — was the stuff that must not survive actually removed, without the model emptying its memory to look good on it (`prune_recall` is always reported next to `over_prune_rate`, and a model that deletes everything is flagged `degenerate_all_delete`);
+- **traps** — did the model notice the planted traps, name them, and still handle the affected constraints correctly. Marking a trap and dealing with it are scored separately, because a model can do the first and fail the second.
+
+The three are a profile and never a weighted total. A prediction that does not carry `trap_flags` is reported as **not evaluated** for the trap axis, never as a zero — "did not use the new field" and "failed to find the trap" are different facts.
+
 Six axes, in three roles: **one primary dimension**, three rankable supporting dimensions, two attribution-only dimensions.
 
 | | Role | Dimension | What it asks |
@@ -43,6 +51,7 @@ Honesty about the gap between this repository and the design document is a proje
 | Four background ablations with an isolated three-arm intervention (six conditions) | **implemented in the harness**; never executed against a real model |
 | Kaplan-Meier survival curve (E), no-compression guard (F) | **implemented**; E now excludes provider failures from the curve instead of scoring them as violations |
 | Judge protocol (three heterogeneous judges, two-class calibration) | **scorer side only** (`judge_calibration`); no judge is wired to a provider yet |
+| Capability profile: retention, pruning, trap marking | **implemented but unexercised** (`score_capabilities` in `scoring.py`, `prompts/induction_v2.txt`); no dialogue carries trap gold yet, so the trap axis reports *not evaluated*, and no model has been scored with it |
 | Scorer thresholds fitted on a human-labelled calibration set | **not implemented**; `configs/calibration.json` is still `uncalibrated` and the two gates in `scoring.py` are still hand-picked. The fitting tool exists and refuses to write a calibrated config without a third-party adjudicator |
 | Eleven-step generation pipeline, BM25+MPNet semantic-disconnect filter | **not implemented**; the shipped filter is a character-bigram approximation and says so in the config |
 | Human annotation, kappa, adjudication, gold freeze | **partial**; the machinery is implemented and the chain is exercised end to end, but no human has filled a sheet yet: no κ has been measured and no gold has been frozen |

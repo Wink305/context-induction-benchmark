@@ -149,6 +149,16 @@
           "configs/calibration.json",
           "scripts/fit_thresholds.py"
         ]
+      },
+      {
+        "id": "capability_profile",
+        "promise": "Capability profile: retention, pruning, trap marking",
+        "state": "partial",
+        "caveat": "The three scorers exist and are tested, but no dialogue carries trap gold yet, so the trap axis reports 'not evaluated' rather than a zero. No model has been scored with them.",
+        "evidence": [
+          "src/context_benchmark/scoring.py",
+          "prompts/induction_v2.txt"
+        ]
       }
     ]
   },

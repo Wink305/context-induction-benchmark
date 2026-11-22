@@ -4,17 +4,23 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from .io import canonical_json
-from .ontology import CATEGORIES, SCOPES, TYPE_TO_CODE
+from .ontology import CATEGORIES, SCOPES, TRAP_KINDS, TYPE_TO_CODE
 
 REQUIRED_FIELDS = {
     "id", "type", "text", "evidence_turns", "valid_from", "valid_to",
     "scope", "superseded_by", "category",
 }
 BASE_FIELDS = REQUIRED_FIELDS
+
+# The root object carries the constraint list and, optionally, the trap flags.
+# ``trap_flags`` is optional on purpose: a prediction produced before this
+# contract existed is still a valid prediction, and the trap axis reports
+# "not evaluated" for it rather than scoring it zero.
+ALLOWED_ROOT_KEYS = {"constraints", "trap_flags"}
 
 
 @dataclass(frozen=True)
@@ -29,6 +35,11 @@ class ValidationReport:
     valid: bool
     issues: list[Issue]
     constraint_n: int = 0
+    # Problems with an individual trap flag. They are deliberately kept out of
+    # ``issues``: a malformed flag must not invalidate the constraints, because
+    # one broken annotation in an extra field would otherwise zero the whole
+    # dialogue on axes A and C. The trap axis reads these separately.
+    trap_issues: list[Issue] = field(default_factory=list)
 
     @property
     def schema_error_n(self) -> int:
@@ -38,13 +49,19 @@ class ValidationReport:
     def semantic_error_n(self) -> int:
         return len(self.issues) - self.schema_error_n
 
+    @property
+    def trap_error_n(self) -> int:
+        return len(self.trap_issues)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "valid": self.valid,
             "constraint_n": self.constraint_n,
             "schema_error_n": self.schema_error_n,
             "semantic_error_n": self.semantic_error_n,
+            "trap_error_n": self.trap_error_n,
             "issues": [asdict(issue) for issue in self.issues],
+            "trap_issues": [asdict(issue) for issue in self.trap_issues],
         }
 
 
@@ -60,10 +77,85 @@ def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def validate_trap_flags(
+    flags: Any,
+    turns: list[dict[str, Any]] | None = None,
+    constraint_ids: set[str] | None = None,
+) -> list[Issue]:
+    """Validate the optional ``trap_flags`` array.
+
+    A flag is a claim about the dialogue: "this kind of trap is here, at
+    these turns, for this reason". Every part of the claim must be checkable
+    by a program, because the trap axis is scored mechanically — no judge is
+    involved.
+    """
+    if flags is None:
+        return []
+    if not isinstance(flags, list):
+        return [Issue("schema_trap_flags", "trap_flags must be an array", "$.trap_flags")]
+    issues: list[Issue] = []
+    turn_map = {turn["turn"]: turn for turn in (turns or [])}
+    for index, flag in enumerate(flags):
+        path = f"$.trap_flags[{index}]"
+        if not isinstance(flag, dict):
+            issues.append(Issue("schema_trap_flag", "trap flag must be an object", path))
+            continue
+        kind = flag.get("kind")
+        if kind not in TRAP_KINDS:
+            issues.append(Issue(
+                "schema_trap_kind",
+                f"kind must be one of {', '.join(TRAP_KINDS)}",
+                path,
+            ))
+        target = flag.get("target_turns")
+        if not isinstance(target, list) or not target or any(not _is_int(turn) for turn in target):
+            issues.append(Issue(
+                "schema_trap_turns",
+                "target_turns must be a non-empty integer array",
+                path,
+            ))
+        elif turn_map:
+            for turn in target:
+                if turn not in turn_map:
+                    issues.append(Issue(
+                        "semantic_trap_turn_missing", f"turn {turn} does not exist", path
+                    ))
+                elif turn_map[turn]["speaker"] != "user":
+                    issues.append(Issue(
+                        "semantic_trap_turn_not_user", f"turn {turn} is not user-side", path
+                    ))
+        reason = flag.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            issues.append(Issue(
+                "schema_trap_reason", "reason must be a non-empty string", path
+            ))
+        ref = flag.get("constraint_ref")
+        if ref is not None:
+            if not isinstance(ref, str) or not ref:
+                issues.append(Issue(
+                    "schema_trap_ref", "constraint_ref must be a string or null", path
+                ))
+            elif constraint_ids and ref not in constraint_ids:
+                issues.append(Issue(
+                    "semantic_trap_ref_missing",
+                    f"constraint_ref {ref} is not one of this output's constraints",
+                    path,
+                ))
+    return issues
+
+
 def validate_output(value: Any, turns: list[dict[str, Any]] | None = None) -> ValidationReport:
     issues: list[Issue] = []
-    if not isinstance(value, dict) or set(value) != {"constraints"} or not isinstance(value.get("constraints"), list):
-        return ValidationReport(False, [Issue("schema_root", "root must contain only a constraints array", "$")])
+    if (
+        not isinstance(value, dict)
+        or not set(value).issubset(ALLOWED_ROOT_KEYS)
+        or "constraints" not in value
+        or not isinstance(value.get("constraints"), list)
+    ):
+        return ValidationReport(
+            False,
+            [Issue("schema_root", "root must contain a constraints array and may contain trap_flags", "$")],
+        )
     constraints = value["constraints"]
     turn_map = {turn["turn"]: turn for turn in (turns or [])}
     ids: set[str] = set()
@@ -127,6 +219,7 @@ def validate_output(value: Any, turns: list[dict[str, Any]] | None = None) -> Va
             if _is_int(valid_from) and valid_from not in evidence:
                 issues.append(Issue("semantic_valid_from_evidence", "valid_from must occur in evidence_turns", f"{path}.valid_from"))
     by_id = {item.get("id"): item for item in constraints if isinstance(item, dict)}
+    trap_issues = validate_trap_flags(value.get("trap_flags"), turns, set(ids))
     for index, item in enumerate(constraints):
         if not isinstance(item, dict):
             continue
@@ -141,7 +234,7 @@ def validate_output(value: Any, turns: list[dict[str, Any]] | None = None) -> Va
                 target_from = by_id[target_id].get("valid_from")
                 if _is_int(target_from) and _is_int(item.get("valid_to")) and target_from <= item["valid_to"]:
                     issues.append(Issue("semantic_supersession_order", "replacement must begin after old validity ends", path))
-    return ValidationReport(not issues, issues, len(constraints))
+    return ValidationReport(not issues, issues, len(constraints), trap_issues=trap_issues)
 
 
 def public_constraint(item: dict[str, Any]) -> dict[str, Any]:

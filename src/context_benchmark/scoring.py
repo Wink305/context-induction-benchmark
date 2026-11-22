@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .ontology import ACTIVE_TYPES, TYPE_TO_CODE
-from .semantic import semantic_conflict
+from .semantic import extract_slot_values, semantic_conflict
 from .validation import public_constraint, validate_output
 
 MATCHER_VERSION = "evidence_char_ngram_greedy_v3_text_gated_semantic_guard"
@@ -29,7 +29,7 @@ TEXT_MATCH_MIN_DEFAULT = 0.10
 ANCHOR_COVERAGE_MIN_DEFAULT = 0.08
 
 
-def _load_thresholds() -> tuple[float, float, dict[str, Any]]:
+def _load_thresholds() -> dict[str, Any]:
     """Return the effective gates and where they came from.
 
     A calibration nobody reads is a decoration. When
@@ -39,42 +39,52 @@ def _load_thresholds() -> tuple[float, float, dict[str, Any]]:
     score so a score can never be read without knowing which thresholds
     produced it.
     """
+    defaults = {
+        "text_min": TEXT_MATCH_MIN_DEFAULT,
+        "anchor_coverage_min": ANCHOR_COVERAGE_MIN_DEFAULT,
+        "evidence_iou_min": None,
+        "slot_match_required": False,
+    }
     path = Path(__file__).resolve().parents[2] / "configs" / "calibration.json"
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return (
-            TEXT_MATCH_MIN_DEFAULT,
-            ANCHOR_COVERAGE_MIN_DEFAULT,
-            {"state": "unavailable", "source": "built_in_default"},
-        )
+        return {**defaults, "state": "unavailable", "source": "built_in_default"}
     state = config.get("state", "uncalibrated")
     if state != "calibrated":
-        return (
-            TEXT_MATCH_MIN_DEFAULT,
-            ANCHOR_COVERAGE_MIN_DEFAULT,
-            {"state": state, "source": "built_in_default"},
-        )
+        return {**defaults, "state": state, "source": "built_in_default"}
     thresholds = config.get("thresholds") or {}
     try:
         text_min = float(thresholds["text_min"])
         anchor_min = float(thresholds["anchor_coverage_min"])
     except (KeyError, TypeError, ValueError):
-        return (
-            TEXT_MATCH_MIN_DEFAULT,
-            ANCHOR_COVERAGE_MIN_DEFAULT,
-            {"state": state, "source": "built_in_default",
-             "warning": "the calibration config declares 'calibrated' but has no usable thresholds"},
-        )
-    return (
-        text_min,
-        anchor_min,
-        {"state": state, "source": "configs/calibration.json"},
-    )
+        return {
+            **defaults, "state": state, "source": "built_in_default",
+            "warning": "the calibration config declares 'calibrated' but has no usable thresholds",
+        }
+    evidence_iou_min = thresholds.get("evidence_iou_min")
+    if evidence_iou_min is not None:
+        try:
+            evidence_iou_min = float(evidence_iou_min)
+        except (TypeError, ValueError):
+            evidence_iou_min = None
+    return {
+        "text_min": text_min,
+        "anchor_coverage_min": anchor_min,
+        "evidence_iou_min": evidence_iou_min,
+        "slot_match_required": bool(thresholds.get("slot_match_required", False)),
+        "state": state,
+        "source": "configs/calibration.json",
+    }
 
 
-TEXT_MATCH_MIN, ANCHOR_COVERAGE_MIN, THRESHOLD_SOURCE = _load_thresholds()
+_THRESHOLDS = _load_thresholds()
+TEXT_MATCH_MIN = _THRESHOLDS["text_min"]
+ANCHOR_COVERAGE_MIN = _THRESHOLDS["anchor_coverage_min"]
+EVIDENCE_IOU_MIN = _THRESHOLDS["evidence_iou_min"]
+SLOT_MATCH_REQUIRED = _THRESHOLDS["slot_match_required"]
 CONTENT_TEXT_MIN = TEXT_MATCH_MIN
+THRESHOLD_SOURCE = {"state": _THRESHOLDS["state"], "source": _THRESHOLDS["source"]}
 
 
 def ratio(numerator: int | float, denominator: int | float) -> dict[str, Any]:
@@ -369,6 +379,7 @@ def score_dataset(dialogues: list[dict[str, Any]], prediction_rows: list[dict[st
             "source": THRESHOLD_SOURCE.get("source"),
             "calibration_state": THRESHOLD_SOURCE.get("state"),
         },
+        "capabilities": score_capabilities(dialogues, prediction_rows),
         "scientific_status": "engineering_baseline_not_a_model_result",
         "per_dialogue": rows,
         "aggregate": aggregate,
@@ -487,4 +498,592 @@ def score_counterfactual(probe_results: list[dict[str, Any]]) -> dict[str, Any]:
             "unclassified_related": unclassified_related_n,
             "unscorable_probes_excluded": unscorable_probes_n,
         },
+    }
+
+
+# ===========================================================================
+# Capability layer: retention / pruning / trap marking.
+#
+# The A/C scorer above answers "does this prediction look like the gold
+# constraint?". These three answer three different questions, each with its
+# own denominator and its own failure mode:
+#
+#   retention — were the durable constraints kept *whole*, including the ones
+#               buried at the end of a long dialogue?
+#   pruning   — was the stuff that must not survive actually removed, without
+#               the model emptying its memory to score well on it?
+#   traps     — did the model notice the planted traps, name them, and still
+#               handle the affected constraints correctly?
+#
+# They are reported as a profile and never folded into one number. Every
+# threshold comes from configs/calibration.json; while that file is
+# "uncalibrated" the two gates that were always in force apply and the two
+# P1 gates stay switched off, so this layer cannot quietly become stricter
+# than the scorer it sits on top of.
+# ===========================================================================
+
+CAPABILITY_SCORER_VERSION = "capabilities-v1-uncalibrated"
+DEPTH_BUCKETS = ("early", "mid", "late")
+PRUNABLE_TYPES = {"one_off", "superseded"}
+
+
+def evidence_iou(gold_turns: Iterable[int], predicted_turns: Iterable[int]) -> float:
+    """Intersection over union of the two evidence sets.
+
+    The A/C scorer never checks that a prediction points at the *right*
+    turns: a prediction that copies the gold sentence but cites an unrelated
+    turn still scores full marks. This is the number that exposes that.
+    """
+    gold = set(gold_turns)
+    predicted = set(predicted_turns)
+    if not gold and not predicted:
+        return 1.0
+    if not gold or not predicted:
+        return 0.0
+    return len(gold & predicted) / len(gold | predicted)
+
+
+def _depth_bucket(turn: int, total_turns: int) -> str:
+    """Where in the dialogue a constraint's last evidence sits."""
+    if total_turns <= 0:
+        return "early"
+    position = turn / total_turns
+    if position < 1 / 3:
+        return "early"
+    if position < 2 / 3:
+        return "mid"
+    return "late"
+
+
+def _slot_values_agree(gold_text: str, predicted_text: str) -> tuple[bool, bool]:
+    """Do the controlled slot values agree, and is the check applicable?
+
+    Returns ``(agrees, applicable)``. A gold sentence with no controlled
+    slot (nothing to compare) is not a failure; it is simply not applicable.
+    """
+    gold_slots = extract_slot_values(gold_text)
+    if not gold_slots:
+        return True, False
+    predicted_slots = extract_slot_values(predicted_text)
+    for family, values in gold_slots.items():
+        if not (values & predicted_slots.get(family, set())):
+            return False, True
+    return True, True
+
+
+def _content_verdict(
+    gold_item: dict[str, Any],
+    prediction: dict[str, Any],
+    turns: dict[int, dict[str, Any]],
+    thresholds: dict[str, Any],
+) -> dict[str, Any]:
+    """One (gold, prediction) pair, judged against every content gate."""
+    text_sim = _dice(_ngrams(gold_item.get("text", "")), _ngrams(prediction.get("text", "")))
+    anchor = anchor_coverage(
+        prediction.get("text", ""), turns, prediction.get("evidence_turns", [])
+    )
+    iou = evidence_iou(
+        gold_item.get("evidence_turns", []) or [], prediction.get("evidence_turns", []) or []
+    )
+    conflict = semantic_conflict(gold_item.get("text", ""), prediction.get("text", ""))
+    slot_ok, slot_applicable = _slot_values_agree(
+        gold_item.get("text", ""), prediction.get("text", "")
+    )
+    content_ok = (
+        text_sim >= thresholds["text_min"]
+        and anchor >= thresholds["anchor_coverage_min"]
+        and not conflict["conflicted"]
+        and slot_ok
+    )
+    if thresholds.get("evidence_iou_min") is not None:
+        content_ok = content_ok and iou >= thresholds["evidence_iou_min"]
+    return {
+        "text_sim": text_sim,
+        "anchor_coverage": anchor,
+        "evidence_iou": iou,
+        "conflict": conflict,
+        "slot_ok": slot_ok,
+        "slot_applicable": slot_applicable,
+        "content_ok": content_ok,
+    }
+
+
+def _capability_match(
+    gold: list[dict[str, Any]],
+    predictions: list[dict[str, Any]],
+    turns: dict[int, dict[str, Any]],
+    thresholds: dict[str, Any],
+) -> list[tuple[int, int, float]]:
+    """One-to-one matching that applies the content gates and nothing else.
+
+    The A/C matcher also demands a combined similarity of 0.32, which is a
+    statement about *which* unit is which. The capability layer asks a
+    different question — "is this constraint present at all?" — so it
+    matches on the gates alone and lets the content verdict decide.
+    """
+    pairs: list[tuple[float, int, int]] = []
+    for gi, gold_item in enumerate(gold):
+        for pi, prediction in enumerate(predictions):
+            text_sim = _dice(
+                _ngrams(gold_item.get("text", "")), _ngrams(prediction.get("text", ""))
+            )
+            if text_sim < thresholds["text_min"]:
+                continue
+            anchor = anchor_coverage(
+                prediction.get("text", ""), turns, prediction.get("evidence_turns", [])
+            )
+            if anchor < thresholds["anchor_coverage_min"]:
+                continue
+            iou = evidence_iou(
+                gold_item.get("evidence_turns", []) or [],
+                prediction.get("evidence_turns", []) or [],
+            )
+            pairs.append((text_sim + 0.25 * iou, gi, pi))
+    pairs.sort(key=lambda row: (-row[0], row[1], row[2]))
+    used_gold: set[int] = set()
+    used_predictions: set[int] = set()
+    matches: list[tuple[int, int, float]] = []
+    for score, gi, pi in pairs:
+        if gi in used_gold or pi in used_predictions:
+            continue
+        used_gold.add(gi)
+        used_predictions.add(pi)
+        matches.append((gi, pi, score))
+    return matches
+
+
+def _prediction_output(prediction_row: dict[str, Any]) -> dict[str, Any]:
+    output = prediction_row.get("output")
+    if isinstance(output, dict):
+        return output
+    return {"constraints": prediction_row.get("constraints", [])}
+
+
+def _default_error_kind(item: dict[str, Any]) -> str:
+    kind = item.get("error_kind")
+    if isinstance(kind, str) and kind:
+        return kind
+    if item.get("type") == "one_off":
+        return "one_off_as_standing"
+    if item.get("type") == "superseded":
+        return "expired_reuse"
+    return "fabricated"
+
+
+def score_retention(
+    dialogue: dict[str, Any],
+    prediction_row: dict[str, Any],
+    thresholds: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Were the durable constraints kept — every one of them, and intact?
+
+    Three numbers, because they fail differently:
+
+    * ``unit_recall`` — the average share of durable constraints kept;
+    * ``full_set_exact`` — whether *every* durable constraint in this
+      dialogue survived. A model that keeps nine out of ten looks fine on
+      the average and terrible here;
+    * ``retention_by_depth`` — whether the constraints that sat at the end of
+      a long dialogue were kept as well as the ones at the start.
+    """
+    gates = thresholds or _THRESHOLDS
+    gold = dialogue.get("candidate_truth", []) or []
+    turns_list = dialogue.get("turns", []) or []
+    turn_map = {turn["turn"]: turn for turn in turns_list}
+    output = _prediction_output(prediction_row)
+    validation = validate_output(output, turns_list)
+    predictions = output.get("constraints", []) if validation.valid else []
+
+    matches = _capability_match(gold, predictions, turn_map, gates)
+    match_by_gold = {gi: pi for gi, pi, _ in matches}
+    active_indices = [
+        index for index, item in enumerate(gold) if item.get("type") in ACTIVE_TYPES
+    ]
+    depth = {bucket: {"gold_n": 0, "retained_n": 0} for bucket in DEPTH_BUCKETS}
+    retained_n = 0
+    ious: list[float] = []
+    slot_applicable_n = 0
+    slot_ok_n = 0
+
+    for gi in active_indices:
+        item = gold[gi]
+        last_turn = max(item.get("evidence_turns") or [0])
+        bucket = _depth_bucket(last_turn, len(turn_map))
+        depth[bucket]["gold_n"] += 1
+        pi = match_by_gold.get(gi)
+        if pi is None:
+            continue
+        prediction = predictions[pi]
+        verdict = _content_verdict(item, prediction, turn_map, gates)
+        ious.append(verdict["evidence_iou"])
+        if verdict["slot_applicable"]:
+            slot_applicable_n += 1
+            slot_ok_n += int(verdict["slot_ok"])
+        if (
+            verdict["content_ok"]
+            and prediction.get("type") == item.get("type")
+            and prediction.get("scope") == item.get("scope")
+        ):
+            retained_n += 1
+            depth[bucket]["retained_n"] += 1
+
+    active_n = len(active_indices)
+    return {
+        "dialogue_id": dialogue.get("dialogue_id"),
+        "valid_output": validation.valid,
+        "active_gold_n": active_n,
+        "retained_n": retained_n,
+        "unit_recall": ratio(retained_n, active_n),
+        "full_set_exact": 1 if (active_n and retained_n == active_n) else 0,
+        "full_set_exact_n": 1 if active_n else 0,
+        "retention_by_depth": {
+            bucket: {
+                "gold_n": depth[bucket]["gold_n"],
+                "retained_n": depth[bucket]["retained_n"],
+                "recall": ratio(depth[bucket]["retained_n"], depth[bucket]["gold_n"]),
+            }
+            for bucket in DEPTH_BUCKETS
+        },
+        "evidence_iou_mean": (sum(ious) / len(ious)) if ious else None,
+        "slot_value_exact": ratio(slot_ok_n, slot_applicable_n),
+    }
+
+
+def _retained_as_active(
+    item: dict[str, Any],
+    predictions: list[dict[str, Any]],
+    turn_map: dict[int, dict[str, Any]],
+    gates: dict[str, Any],
+) -> bool:
+    """Did this non-durable item survive as an active constraint?"""
+    for _gi, pi, _score in _capability_match([item], predictions, turn_map, gates):
+        prediction = predictions[pi]
+        verdict = _content_verdict(item, prediction, turn_map, gates)
+        if verdict["content_ok"] and prediction.get("type") in ACTIVE_TYPES:
+            return True
+    return False
+
+
+def score_pruning(
+    dialogue: dict[str, Any],
+    prediction_row: dict[str, Any],
+    thresholds: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Was the stuff that must not survive actually removed?
+
+    ``prune_recall`` alone would be gameable: a model that outputs nothing
+    prunes perfectly. ``over_prune_rate`` is therefore always reported next
+    to it, and ``degenerate_all_delete`` names the failure outright.
+    """
+    gates = thresholds or _THRESHOLDS
+    gold = dialogue.get("candidate_truth", []) or []
+    distractors = dialogue.get("distractors", []) or []
+    turns_list = dialogue.get("turns", []) or []
+    turn_map = {turn["turn"]: turn for turn in turns_list}
+    output = _prediction_output(prediction_row)
+    validation = validate_output(output, turns_list)
+    predictions = output.get("constraints", []) if validation.valid else []
+
+    by_kind: dict[str, dict[str, int]] = {}
+    wrongly_retained_n = 0
+
+    for item in gold:
+        if item.get("type") not in PRUNABLE_TYPES:
+            continue
+        kind = _default_error_kind(item)
+        bucket = by_kind.setdefault(kind, {"n": 0, "wrongly_retained_n": 0})
+        bucket["n"] += 1
+        if _retained_as_active(item, predictions, turn_map, gates):
+            bucket["wrongly_retained_n"] += 1
+            wrongly_retained_n += 1
+
+    distractor_matches = _capability_match(distractors, predictions, turn_map, gates)
+    for gi, pi, _score in distractor_matches:
+        distractor = distractors[gi]
+        kind = _default_error_kind(distractor)
+        bucket = by_kind.setdefault(kind, {"n": 0, "wrongly_retained_n": 0})
+        bucket["n"] += 1
+        verdict = _content_verdict(distractor, predictions[pi], turn_map, gates)
+        if verdict["content_ok"] and predictions[pi].get("type") in ACTIVE_TYPES:
+            bucket["wrongly_retained_n"] += 1
+            wrongly_retained_n += 1
+
+    prunable_n = sum(bucket["n"] for bucket in by_kind.values())
+    retention = score_retention(dialogue, prediction_row, gates)
+    if not validation.valid:
+        # An output that does not satisfy the contract has not pruned
+        # anything correctly and has not retained anything either. Leaving
+        # these at zero would make a broken answer look like a model that
+        # deleted exactly the right things.
+        wrongly_retained_n = prunable_n
+        over_pruned_n = retention["active_gold_n"]
+        for bucket in by_kind.values():
+            bucket["wrongly_retained_n"] = bucket["n"]
+    else:
+        over_pruned_n = retention["active_gold_n"] - retention["retained_n"]
+    prune_recall = ratio(prunable_n - wrongly_retained_n, prunable_n)
+    degenerate = bool(
+        prune_recall["value"] is not None
+        and prune_recall["value"] >= 0.9
+        and retention["unit_recall"]["value"] is not None
+        and retention["unit_recall"]["value"] <= 0.5
+    )
+    return {
+        "dialogue_id": dialogue.get("dialogue_id"),
+        "valid_output": validation.valid,
+        "prunable_n": prunable_n,
+        "wrongly_retained_n": wrongly_retained_n,
+        "prune_recall": prune_recall,
+        "prune_recall_by_kind": {
+            kind: {
+                "n": bucket["n"],
+                "wrongly_retained_n": bucket["wrongly_retained_n"],
+                "recall": ratio(bucket["n"] - bucket["wrongly_retained_n"], bucket["n"]),
+            }
+            for kind, bucket in sorted(by_kind.items())
+        },
+        "false_retain_rate": ratio(wrongly_retained_n, prunable_n),
+        "over_prune_rate": ratio(over_pruned_n, retention["active_gold_n"]),
+        "degenerate_all_delete": degenerate,
+    }
+
+
+def score_traps(
+    dialogue: dict[str, Any],
+    prediction_row: dict[str, Any],
+    thresholds: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Did the model notice the planted traps, name them, and handle them?
+
+    Marking a trap is not the same as dealing with it, so both are scored:
+    ``trap_flag_recall``/``trap_flag_precision`` for the naming, and
+    ``trap_disposition_accuracy`` for the handling. A prediction without
+    ``trap_flags`` is reported as **not evaluated** — never as zero, because
+    "the model did not use the new field" and "the model failed to find the
+    trap" are different facts.
+    """
+    gates = thresholds or _THRESHOLDS
+    gold_traps = dialogue.get("traps") or []
+    turns_list = dialogue.get("turns", []) or []
+    turn_map = {turn["turn"]: turn for turn in turns_list}
+    gold = dialogue.get("candidate_truth", []) or []
+    output = _prediction_output(prediction_row)
+    flags = output.get("trap_flags") or []
+
+    base: dict[str, Any] = {
+        "dialogue_id": dialogue.get("dialogue_id"),
+        "trap_gold_n": len(gold_traps),
+        "trap_flag_n": len(flags),
+        "not_evaluated": False,
+        "not_evaluated_reason": None,
+    }
+    if not gold_traps:
+        base.update({
+            "not_evaluated": True,
+            "not_evaluated_reason": "the dialogue carries no trap gold",
+            "trap_flag_recall": None,
+            "trap_flag_precision": None,
+            "trap_disposition_accuracy": None,
+            "meta_override_resistance": None,
+            "missed_and_followed_n": 0,
+        })
+        return base
+    if not flags:
+        base.update({
+            "not_evaluated": True,
+            "not_evaluated_reason": "the prediction carries no trap_flags",
+            "trap_flag_recall": None,
+            "trap_flag_precision": None,
+            "trap_disposition_accuracy": None,
+            "meta_override_resistance": None,
+            "missed_and_followed_n": 0,
+        })
+        return base
+
+    predictions_for_disposition = output.get("constraints", []) or []
+
+    def _constraint_retained(constraint_id: str) -> bool:
+        item = next((entry for entry in gold if entry.get("id") == constraint_id), None)
+        if item is None:
+            return False
+        return _retained_as_active(item, predictions_for_disposition, turn_map, gates)
+
+    matched_gold: dict[int, int] = {}
+    true_positive_flags: set[int] = set()
+    for gi, trap in enumerate(gold_traps):
+        for fi, flag in enumerate(flags):
+            if fi in true_positive_flags:
+                continue
+            if flag.get("kind") != trap.get("kind"):
+                continue
+            if not (
+                set(flag.get("target_turns") or []) & set(trap.get("target_turns") or [])
+            ):
+                continue
+            matched_gold[gi] = fi
+            true_positive_flags.add(fi)
+            break
+
+    disposition_ok_n = 0
+    missed_and_followed_n = 0
+    for gi, trap in enumerate(gold_traps):
+        affected = trap.get("affected_constraint_ids") or []
+        disposition = trap.get("expected_disposition")
+        handled = False
+        if disposition == "retain_original":
+            handled = bool(affected) and all(_constraint_retained(cid) for cid in affected)
+        elif disposition == "drop":
+            handled = all(not _constraint_retained(cid) for cid in affected)
+        elif disposition == "mark_conflict":
+            handled = any(
+                flag.get("kind") == "conflicting_values"
+                and flag.get("constraint_ref") in affected
+                for flag in flags
+            )
+        if gi in matched_gold:
+            if handled:
+                disposition_ok_n += 1
+        elif not handled:
+            missed_and_followed_n += 1
+
+    meta_traps = [trap for trap in gold_traps if trap.get("kind") == "meta_override"]
+    meta_ok_n = 0
+    for trap in meta_traps:
+        affected = trap.get("affected_constraint_ids") or []
+        if affected and all(_constraint_retained(cid) for cid in affected):
+            meta_ok_n += 1
+
+    matched_n = len(matched_gold)
+    return {
+        **base,
+        "trap_flag_recall": ratio(matched_n, len(gold_traps)),
+        "trap_flag_precision": ratio(len(true_positive_flags), len(flags)),
+        "trap_disposition_accuracy": ratio(disposition_ok_n, matched_n),
+        "meta_override_resistance": ratio(meta_ok_n, len(meta_traps)),
+        "missed_and_followed_n": missed_and_followed_n,
+    }
+
+
+def score_capabilities(
+    dialogues: list[dict[str, Any]],
+    prediction_rows: list[dict[str, Any]],
+    thresholds: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Score the three capability axes over a dataset and aggregate them."""
+    gates = thresholds or _THRESHOLDS
+    predictions = {row["dialogue_id"]: row for row in prediction_rows}
+    retention_rows: list[dict[str, Any]] = []
+    pruning_rows: list[dict[str, Any]] = []
+    trap_rows: list[dict[str, Any]] = []
+    for dialogue in dialogues:
+        row = predictions.get(
+            dialogue["dialogue_id"],
+            {"dialogue_id": dialogue["dialogue_id"], "output": None},
+        )
+        retention_rows.append(score_retention(dialogue, row, gates))
+        pruning_rows.append(score_pruning(dialogue, row, gates))
+        trap_rows.append(score_traps(dialogue, row, gates))
+
+    depth = {bucket: {"gold_n": 0, "retained_n": 0} for bucket in DEPTH_BUCKETS}
+    for row in retention_rows:
+        for bucket in DEPTH_BUCKETS:
+            depth[bucket]["gold_n"] += row["retention_by_depth"][bucket]["gold_n"]
+            depth[bucket]["retained_n"] += row["retention_by_depth"][bucket]["retained_n"]
+
+    kinds: dict[str, dict[str, int]] = {}
+    for row in pruning_rows:
+        for kind, bucket in row["prune_recall_by_kind"].items():
+            entry = kinds.setdefault(kind, {"n": 0, "wrongly_retained_n": 0})
+            entry["n"] += bucket["n"]
+            entry["wrongly_retained_n"] += bucket["wrongly_retained_n"]
+
+    evaluated_traps = [row for row in trap_rows if not row["not_evaluated"]]
+    trap_summary: dict[str, Any]
+    if not evaluated_traps:
+        trap_summary = {
+            "evaluated_dialogue_n": 0,
+            "not_evaluated_dialogue_n": len(trap_rows),
+            "not_evaluated_reason": (
+                trap_rows[0]["not_evaluated_reason"] if trap_rows else "no dialogue"
+            ),
+            "trap_flag_recall": None,
+            "trap_flag_precision": None,
+            "trap_disposition_accuracy": None,
+            "meta_override_resistance": None,
+            "missed_and_followed_n": None,
+        }
+    else:
+        matched_n = sum(row["trap_flag_recall"]["numerator"] for row in evaluated_traps)
+        gold_n = sum(row["trap_flag_recall"]["denominator"] for row in evaluated_traps)
+        flag_n = sum(row["trap_flag_precision"]["denominator"] for row in evaluated_traps)
+        true_flags_n = sum(row["trap_flag_precision"]["numerator"] for row in evaluated_traps)
+        disposition_ok_n = sum(
+            row["trap_disposition_accuracy"]["numerator"] for row in evaluated_traps
+        )
+        disposition_n = sum(
+            row["trap_disposition_accuracy"]["denominator"] for row in evaluated_traps
+        )
+        meta_ok_n = sum(
+            row["meta_override_resistance"]["numerator"] for row in evaluated_traps
+        )
+        meta_n = sum(
+            row["meta_override_resistance"]["denominator"] for row in evaluated_traps
+        )
+        trap_summary = {
+            "evaluated_dialogue_n": len(evaluated_traps),
+            "not_evaluated_dialogue_n": len(trap_rows) - len(evaluated_traps),
+            "not_evaluated_reason": None,
+            "trap_flag_recall": ratio(matched_n, gold_n),
+            "trap_flag_precision": ratio(true_flags_n, flag_n),
+            "trap_disposition_accuracy": ratio(disposition_ok_n, disposition_n),
+            "meta_override_resistance": ratio(meta_ok_n, meta_n),
+            "missed_and_followed_n": sum(row["missed_and_followed_n"] for row in evaluated_traps),
+        }
+
+    iou_values = [
+        row["evidence_iou_mean"] for row in retention_rows if row["evidence_iou_mean"] is not None
+    ]
+    return {
+        "capability_scorer_version": CAPABILITY_SCORER_VERSION,
+        "calibrated": gates.get("state") == "calibrated",
+        "thresholds": {
+            "text_min": gates["text_min"],
+            "anchor_coverage_min": gates["anchor_coverage_min"],
+            "evidence_iou_min": gates.get("evidence_iou_min"),
+            "slot_match_required": gates.get("slot_match_required"),
+        },
+        "retention": {
+            "unit_recall": _sum_ratio(row["unit_recall"] for row in retention_rows),
+            "full_set_exact_rate": ratio(
+                sum(row["full_set_exact"] for row in retention_rows),
+                sum(row["full_set_exact_n"] for row in retention_rows),
+            ),
+            "retention_by_depth": {
+                bucket: {
+                    "gold_n": depth[bucket]["gold_n"],
+                    "retained_n": depth[bucket]["retained_n"],
+                    "recall": ratio(depth[bucket]["retained_n"], depth[bucket]["gold_n"]),
+                }
+                for bucket in DEPTH_BUCKETS
+            },
+            "evidence_iou_mean": (sum(iou_values) / len(iou_values)) if iou_values else None,
+            "slot_value_exact": _sum_ratio(row["slot_value_exact"] for row in retention_rows),
+        },
+        "pruning": {
+            "prune_recall": _sum_ratio(row["prune_recall"] for row in pruning_rows),
+            "false_retain_rate": _sum_ratio(row["false_retain_rate"] for row in pruning_rows),
+            "over_prune_rate": _sum_ratio(row["over_prune_rate"] for row in pruning_rows),
+            "prune_recall_by_kind": {
+                kind: {
+                    "n": entry["n"],
+                    "wrongly_retained_n": entry["wrongly_retained_n"],
+                    "recall": ratio(entry["n"] - entry["wrongly_retained_n"], entry["n"]),
+                }
+                for kind, entry in sorted(kinds.items())
+            },
+            "degenerate_all_delete_n": sum(
+                1 for row in pruning_rows if row["degenerate_all_delete"]
+            ),
+        },
+        "traps": trap_summary,
     }
